@@ -97,4 +97,13 @@ pub struct Config {
     /// Preview window height (ignored in wallpaper mode).
     #[arg(long, default_value_t = 720)]
     pub height: u32,
+
+    /// Render the scene offscreen (no window) and save a PNG here, then exit.
+    /// Uses --shader / --width / --height / --ssaa / --sim-time.
+    #[arg(long)]
+    pub screenshot: Option<PathBuf>,
+
+    /// Simulated iTime in seconds for --screenshot (audio is silent).
+    #[arg(long, default_value_t = 20.0)]
+    pub sim_time: f32,
 }

@@ -55,6 +55,7 @@
 | `persist.rs` | 설정 영속화 — `%APPDATA%/real_live_wall/config.toml` (serde+toml) 로드/저장 |
 | `tray.rs` | 시스템 트레이 아이콘 + 팝업 메뉴 (전용 스레드·메시지 루프, `Shell_NotifyIconW`) |
 | `startup.rs` | 로그인 자동 시작 — HKCU Run 레지스트리 키 등록/해제 |
+| `screenshot.rs` | 헤드리스 QA 경로(`--screenshot`) — 창 없이 씬을 HDR 포스트FX까지 오프스크린 렌더해 PNG로 저장 |
 
 ## uniform 계약
 

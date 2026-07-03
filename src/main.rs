@@ -17,6 +17,7 @@ mod platform;
 mod postfx;
 mod reactive;
 mod renderer;
+mod screenshot;
 mod shader;
 mod startup;
 mod tray;
@@ -33,6 +34,11 @@ fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = config::Config::parse();
+
+    // `--screenshot`: render one frame offscreen, save a PNG and quit.
+    if let Some(out) = config.screenshot.clone() {
+        return screenshot::run(&config, &out);
+    }
 
     // `--stop`: just signal any running wallpaper and quit — no window needed.
     if config.stop {

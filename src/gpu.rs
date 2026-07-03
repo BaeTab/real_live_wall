@@ -20,8 +20,10 @@ pub struct GpuContext {
 }
 
 /// A single window's surface + swapchain, backed by a shared [`GpuContext`].
+/// `surface` is `None` for the headless (`--screenshot`) path, where the caller
+/// renders into its own texture instead of a swapchain.
 pub struct Gpu {
-    pub surface: wgpu::Surface<'static>,
+    pub surface: Option<wgpu::Surface<'static>>,
     // Cheap handle clones of the shared context (Arc under the hood).
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -109,12 +111,67 @@ impl GpuContext {
         surface.configure(&self.device, &config);
 
         Ok(Gpu {
-            surface,
+            surface: Some(surface),
             device: self.device.clone(),
             queue: self.queue.clone(),
             config,
             size: (width, height),
         })
+    }
+
+    /// Bootstrap a windowless GPU for offscreen rendering (`--screenshot`):
+    /// the same device/queue path, but no surface — the caller renders into its
+    /// own texture. Works with the desktop locked.
+    pub fn new_headless(width: u32, height: u32) -> anyhow::Result<(Self, Gpu)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: None,
+        });
+
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .context("no suitable GPU adapter found")?;
+
+        log::info!("gpu(headless): using adapter {:?}", adapter.get_info().name);
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("rlw-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            ..Default::default()
+        }))
+        .context("failed to acquire GPU device")?;
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
+        let gpu = Gpu {
+            surface: None,
+            device: device.clone(),
+            queue: queue.clone(),
+            config,
+            size: (width.max(1), height.max(1)),
+        };
+        let ctx = Self {
+            _instance: instance,
+            adapter,
+            device,
+            queue,
+        };
+        Ok((ctx, gpu))
     }
 }
 
@@ -126,18 +183,24 @@ impl Gpu {
         self.size = (width, height);
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
     }
 
     /// Reconfigure the surface after a Lost/Outdated acquisition.
     pub fn reconfigure(&mut self) {
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
     }
 
     /// Acquire the next swapchain image, transparently reconfiguring on
     /// outdated/lost surfaces. `None` means "skip this frame".
     pub fn acquire(&mut self) -> Option<wgpu::SurfaceTexture> {
-        match self.surface.get_current_texture() {
+        // Take the result first so the surface borrow ends before reconfigure().
+        let acquired = self.surface.as_ref()?.get_current_texture();
+        match acquired {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
                 Some(t)
             }

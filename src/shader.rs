@@ -17,7 +17,10 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
 }
 "#;
 
-/// Built-in default scene: an audio-reactive aurora with a spectrum equalizer.
+/// Built-in default scene: "Aurora Borealis" — a night-sky aurora over a
+/// mountain lake with a 64-band spectrum equalizer on the near shore.
+/// Rendered to an Rgba16Float HDR target; emitters push past 1.0 to drive the
+/// bright-pass + bloom stage, while the average luminance stays low (night).
 /// Guaranteed to compile so the engine always shows something on first run.
 pub const DEFAULT_WGSL_FS: &str = r#"
 struct Uniforms {
@@ -31,15 +34,25 @@ struct Uniforms {
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
+// Dynamic index into the uniform spectrum array (this split form is what naga
+// accepts for a uniform array<vec4> lookup).
 fn spec(x: f32) -> f32 {
     let i = i32(clamp(x, 0.0, 1.0) * 63.0);
     return u.spectrum[i / 4][i % 4];
 }
 
+// sin-free hashes (Hoskins) — trig-based hashes collapse into visible blocks
+// on GPUs whose fp32 sin loses precision for large arguments.
 fn hash(p: vec2<f32>) -> f32 {
-    let q = fract(p * vec2<f32>(123.34, 345.45));
-    let r = q + dot(q, q + 34.345);
-    return fract(r.x * r.y);
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn hash22(p: vec2<f32>) -> vec2<f32> {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
 }
 
 fn vnoise(p: vec2<f32>) -> f32 {
@@ -59,60 +72,204 @@ fn fbm(p0: vec2<f32>) -> f32 {
     var a = 0.5;
     for (var k = 0; k < 5; k = k + 1) {
         v = v + a * vnoise(p);
-        p = p * 2.0 + vec2<f32>(37.0, 17.0);
+        // rotate + scale each octave so the value-noise lattice never lines up
+        p = vec2<f32>(1.6 * p.x + 1.2 * p.y, -1.2 * p.x + 1.6 * p.y) + vec2<f32>(3.7, 1.7);
         a = a * 0.5;
     }
     return v;
 }
 
+// Unsigned distance from point p to the segment a-b (used for equalizer bars).
+fn sd_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / (dot(ba, ba) + 1e-4), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+// One aurora curtain: emission intensity at aspect-corrected x = cx0 and
+// height sky (0 at the horizon, 1 at the top of the frame). The curtain hangs
+// from a meandering foot line; its rays lean sideways as they climb.
+fn curtain(cx0: f32, sky: f32, t: f32, seed: f32, foot_h: f32, warp: f32, lean: f32) -> f32 {
+    let above = sky - (foot_h
+        + sin(cx0 * 1.05 + t * 0.10 + seed) * 0.090
+        + sin(cx0 * 0.43 - t * 0.063 + seed * 1.7) * 0.060
+        + warp * 0.20);
+    // bright glowing foot, exponential fade upward, soft cut below the foot
+    let env = exp(-max(above, 0.0) * 3.6) * smoothstep(-0.06, 0.02, above);
+    let cx = cx0 + max(above, 0.0) * lean;
+    // near-vertical ray columns: broad brightness variation x fine streaks.
+    // Multiplying keeps the envelope smooth (no triangular tips); deep contrast
+    // leaves genuinely dark gaps so the sky shows through the curtain.
+    let r1 = fbm(vec2<f32>(cx * 2.2 + seed * 3.0 - t * 0.030, sky * 0.35 + t * 0.020));
+    let r2 = vnoise(vec2<f32>(cx * 9.0 + seed * 9.0 + t * 0.045, sky * 0.8));
+    let rays = (0.22 + 0.90 * smoothstep(0.35, 0.85, r1)) * (0.55 + 0.60 * r2);
+    return env * rays;
+}
+
+// Accumulated HDR aurora colour from three curtains. Each curtain runs its own
+// green foot -> teal body -> violet crown ramp so every band reads distinctly.
+// Reacts subtly to bass.
+fn aurora_color(cx: f32, sky: f32, t: f32, bass: f32) -> vec3<f32> {
+    // the whole system drifts very slowly across the sky
+    let dx = cx + t * 0.008;
+    let warp = fbm(vec2<f32>(dx * 0.6 + 4.0, sky * 0.5 + t * 0.05)) - 0.5;
+    var acc = vec3<f32>(0.0, 0.0, 0.0);
+    for (var k = 0; k < 3; k = k + 1) {
+        let fk = f32(k);
+        let foot = 0.36 + fk * 0.17;
+        let ity = curtain(dx, sky, t, fk * 3.7, foot, warp, 0.30 - fk * 0.25)
+                * (1.0 - fk * 0.24);
+        let hgt = clamp((sky - foot) * 2.4, 0.0, 1.0);
+        var hue = mix(vec3<f32>(0.15, 1.05, 0.40), vec3<f32>(0.10, 0.75, 0.90),
+                      smoothstep(0.10, 0.55, hgt));
+        hue = mix(hue, vec3<f32>(0.60, 0.25, 1.00), smoothstep(0.50, 1.0, hgt));
+        acc = acc + hue * ity;
+    }
+    return acc * (0.90 + 0.45 * bass) * 1.05;
+}
+
+// One grid layer of procedural stars (additive, slightly tinted).
+fn star_layer(uv: vec2<f32>, aspect: f32, t: f32, density: f32, size: f32,
+              thresh: f32, twinkle: f32, spikes: f32) -> vec3<f32> {
+    let p = vec2<f32>(uv.x * aspect, uv.y) * density;
+    let id = floor(p);
+    let gv = fract(p) - 0.5;
+    let rnd = hash22(id + 3.1) - 0.5;
+    let bright = hash(id + vec2<f32>(11.7, 4.3));
+    let present = smoothstep(thresh, thresh + 0.02, bright);   // sparse cells only
+    let lv = gv - rnd * 0.6;
+    let d = length(lv);
+    var s = pow(smoothstep(size, 0.0, d), 2.0);
+    let tw = 0.60 + twinkle * sin(t * 2.2 + bright * 40.0);
+    s = s * tw;
+    // thin diffraction spikes, reserved for the very brightest stars
+    let big = smoothstep(0.985, 1.0, bright) * spikes;
+    let sp = smoothstep(size * 5.0, 0.0, abs(lv.x)) * smoothstep(size * 0.7, 0.0, abs(lv.y))
+           + smoothstep(size * 5.0, 0.0, abs(lv.y)) * smoothstep(size * 0.7, 0.0, abs(lv.x));
+    s = (s + sp * big * 0.5) * present;
+    let tint = mix(vec3<f32>(0.75, 0.85, 1.0), vec3<f32>(1.0, 0.92, 0.82),
+                   hash(id + vec2<f32>(1.9, 7.7)));
+    return tint * s * (0.30 + 0.9 * bright * bright);
+}
+
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let res = u.resolution.xy;
-    let uv = frag.xy / res;              // 0..1, origin top-left
+    let uv = frag.xy / res;                 // 0..1, origin top-left
     let t = u.time.x;
     let bass = u.audio.x;
+    let treble = u.audio.z;
     let vol = u.audio.w;
+    let aspect = res.x / max(res.y, 1.0);
 
-    // --- night-sky gradient -------------------------------------------------
-    var col = mix(vec3<f32>(0.02, 0.03, 0.09), vec3<f32>(0.06, 0.02, 0.16), uv.y);
+    let sky = 1.0 - uv.y;                    // 0 at the water line's floor, 1 at the top
+    let cx = (uv.x - 0.5) * aspect;          // aspect-corrected horizontal
+    let horizon = 0.24;                      // sky value of the water line
 
-    // --- aurora ribbons (flow noise, react to bass) -------------------------
-    let q = vec2<f32>(uv.x * 2.0, uv.y * 1.2);
-    let flow = fbm(q * 3.0 + vec2<f32>(0.0, t * 0.15));
-    let f2 = fbm(q * 5.0 - vec2<f32>(t * 0.10, flow * 1.5));
-    let ribbon = smoothstep(0.35, 0.9, f2) * (0.55 + 1.5 * bass);
-    let aurora = mix(vec3<f32>(0.10, 0.95, 0.60), vec3<f32>(0.30, 0.45, 1.0), flow);
-    col = col + ribbon * aurora * (1.0 - uv.y);
+    // --- night-sky vertical gradient ---------------------------------------
+    var col = mix(vec3<f32>(0.030, 0.045, 0.090),
+                  vec3<f32>(0.012, 0.016, 0.045), smoothstep(0.0, 1.0, sky));
+    // faint green airglow hugging the horizon
+    col = col + vec3<f32>(0.02, 0.07, 0.06)
+              * exp(-max(sky - horizon, 0.0) * 5.0) * 0.6;
 
-    // --- stars --------------------------------------------------------------
-    let star = pow(hash(floor(frag.xy * 0.5)), 42.0);
-    col = col + vec3<f32>(star) * (0.4 + 0.6 * sin(t * 3.0 + uv.x * 60.0)) * (1.0 - uv.y * 0.6);
+    // --- milky way band -----------------------------------------------------
+    let mband = cx * 0.55 + (uv.y - 0.30);
+    let mmask = exp(-mband * mband * 7.0);
+    let mcloud = fbm(vec2<f32>(cx * 2.2 + 10.0, uv.y * 3.0 - t * 0.01));
+    let milky = mmask * smoothstep(0.25, 0.85, mcloud);
+    col = col + vec3<f32>(0.10, 0.11, 0.17) * milky * smoothstep(horizon, 0.60, sky);
 
-    // --- bass bloom at the horizon -----------------------------------------
-    let d = distance(uv, vec2<f32>(0.5, 0.28));
-    col = col + vec3<f32>(0.45, 0.22, 0.85) * bass * 0.5 / (d * 6.0 + 1.0);
+    // --- stars (denser inside the milky way, fade toward the horizon) ------
+    let star_fade = smoothstep(horizon, horizon + 0.25, sky);
+    var starcol = star_layer(uv, aspect, t, 150.0, 0.14, 0.80, 0.10, 0.0) * 0.40;
+    starcol = starcol + star_layer(uv, aspect, t, 55.0, 0.10, 0.93, 0.30, 0.0) * 0.85;
+    starcol = starcol + star_layer(uv, aspect, t, 20.0, 0.080, 0.96, 0.45, 1.0)
+                        * (1.25 + 0.5 * treble);
+    col = col + starcol * star_fade * (0.7 + 0.7 * milky);
 
-    // --- spectrum equalizer along the bottom -------------------------------
+    // --- aurora curtains ----------------------------------------------------
+    col = col + aurora_color(cx, sky, t, bass);
+
+    // --- distant mountains (atmospheric haze) ------------------------------
+    let rf = horizon + 0.050 + 0.085 * fbm(vec2<f32>(cx * 0.8 + 20.0, 3.0));
+    let m_far = smoothstep(rf + 0.006, rf - 0.006, sky);
+    col = mix(col, vec3<f32>(0.050, 0.068, 0.115), m_far * 0.92);
+    col = col + vec3<f32>(0.10, 0.14, 0.20)
+              * smoothstep(0.010, 0.0, abs(sky - rf)) * 0.25;     // snow rim on the crest
+
+    // --- near mountains with a conifer-spiked ridge ------------------------
+    let trees = pow(vnoise(vec2<f32>(cx * 40.0, 1.0)), 3.0);
+    let rn = horizon + 0.016 + 0.070 * fbm(vec2<f32>(cx * 1.5 + 5.0, 0.0)) + 0.014 * trees;
+    let m_near = smoothstep(rn + 0.006, rn - 0.006, sky);
+    col = mix(col, vec3<f32>(0.010, 0.014, 0.026), m_near);
+    // aurora rim light kissing the near crest
+    col = col + vec3<f32>(0.10, 0.50, 0.40)
+              * smoothstep(0.012, 0.0, abs(sky - rn)) * 0.18;
+
+    // --- lake reflection below the water line ------------------------------
+    if (sky < horizon) {
+        let depth = horizon - sky;
+        let ripple = sin(cx * 30.0 + t * 0.6) * 0.004
+                   + sin(cx * 13.0 - t * 0.4) * 0.007 * (1.0 + depth * 4.0);
+        // compressed mirror: sample the bright curtain band so the water
+        // actually carries aurora light (a flat mirror would only see the
+        // empty sky below the curtain feet)
+        let refl_sky = horizon + 0.14 + depth * 1.8;
+        var lake = vec3<f32>(0.008, 0.016, 0.038);
+        lake = lake + aurora_color(cx + ripple * 2.0, refl_sky, t, bass)
+                    * exp(-depth * 5.5) * 0.34 * vec3<f32>(0.70, 0.85, 1.0);
+        lake = lake + vec3<f32>(0.02, 0.07, 0.06) * exp(-depth * 10.0) * 0.5;
+        col = lake;
+    }
+
+    // --- 64-band spectrum equalizer on the near shore ----------------------
     let bars = 64.0;
-    let bx = floor(uv.x * bars);
-    let sx = bx / bars;
-    let yb = 1.0 - uv.y;                 // 0 at the bottom of the screen
-    // idle shimmer so the bars always look alive, even in silence
-    let idle = 0.045 + 0.035 * sin(t * 2.0 + bx * 0.5) + 0.025 * sin(t * 5.0 + bx);
-    var h = max(spec(sx), idle * 0.6);
-    h = pow(h, 0.6) * 0.42;
-    let cell = fract(uv.x * bars);
-    let gap = smoothstep(0.04, 0.12, cell) * smoothstep(0.04, 0.12, 1.0 - cell);
-    let barCol = mix(vec3<f32>(0.15, 0.55, 1.0), vec3<f32>(1.0, 0.25, 0.6), clamp(h * 2.0 + sx * 0.3, 0.0, 1.0));
-    let barMask = step(yb, h);
-    let tipGlow = exp(-40.0 * max(0.0, yb - h));
-    col = col + barCol * gap * (barMask * (0.5 + 0.6 * h) + tipGlow * 0.6);
+    let bw = res.x / bars;
+    let idx = floor(frag.x / bw);
+    let sx = (idx + 0.5) / bars;
+    let by = res.y * 0.85;                                        // shore baseline (px)
+    let bcx = (idx + 0.5) * bw;
+    let hw = bw * 0.32;                                           // bar half-width (px)
+    // idle shimmer keeps the bars looking alive even in silence
+    let idle = 0.020 + 0.012 * sin(t * 1.5 + idx * 0.40)
+                     + 0.008 * sin(t * 3.3 - idx * 0.70);
+    let amp = max(spec(sx), 0.0);
+    let h01 = clamp(pow(max(amp, idle), 0.60), 0.0, 1.25);
+    let bh = h01 * res.y * 0.30;
+    let top = vec2<f32>(bcx, by - bh);
+    let base = vec2<f32>(bcx, by);
+    // colour climbs the bar through the aurora palette
+    let hy = clamp((by - frag.y) / (res.y * 0.30), 0.0, 1.0);
+    var bar_col = mix(vec3<f32>(0.10, 1.0, 0.50), vec3<f32>(0.20, 0.80, 1.0),
+                      smoothstep(0.0, 0.45, hy));
+    bar_col = mix(bar_col, vec3<f32>(0.75, 0.35, 1.0), smoothstep(0.40, 0.85, hy));
+    let emis = 0.55 + 1.0 * h01;
+    // upright rounded bar (capsule) with anti-aliased edge
+    let sd_up = sd_segment(frag.xy, base, top) - hw;
+    let up_mask = smoothstep(1.5, -1.0, sd_up);
+    col = mix(col, bar_col * emis, up_mask);
+    // HDR tip glow -> bloom
+    let tipd = length(frag.xy - top);
+    col = col + bar_col * exp(-tipd / (hw * 1.5)) * (0.6 + 1.3 * h01) * 0.7;
+    // mirror reflection into the lake, faded with depth
+    let mp = vec2<f32>(frag.x, 2.0 * by - frag.y);
+    let sd_rf = sd_segment(mp, base, top) - hw;
+    let rf_mask = smoothstep(1.5, -1.0, sd_rf);
+    let rdepth = max(frag.y - by, 0.0) / res.y;
+    col = col + bar_col * emis * rf_mask * exp(-rdepth * 9.0) * 0.45;
 
-    // --- vignette + subtle volume lift -------------------------------------
-    let vig = smoothstep(1.25, 0.35, length(uv - vec2<f32>(0.5)));
-    col = col * vig * (1.0 + 0.15 * vol);
+    // --- subtle vignette + volume lift -------------------------------------
+    let vig = smoothstep(1.35, 0.35, length((uv - 0.5) * vec2<f32>(aspect, 1.0)));
+    col = col * (0.82 + 0.18 * vig);
+    col = col * (1.0 + 0.10 * vol);
 
-    return vec4<f32>(col, 1.0);
+    // --- dithering to kill 8-bit banding -----------------------------------
+    let dither = (hash(frag.xy + t) - 0.5) / 255.0;
+    col = col + vec3<f32>(dither);
+
+    return vec4<f32>(max(col, vec3<f32>(0.0)), 1.0);
 }
 "#;
 

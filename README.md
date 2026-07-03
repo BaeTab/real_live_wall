@@ -31,16 +31,24 @@
 
 ![real_live_wall 설정 GUI](docs/screenshots/gui.png)
 
-**시네마틱 자연 씬** — `sunset_clouds`(도메인워프 fbm 구름 + 태양 블룸). 씬을 고르고
-**"바탕화면에 적용"**을 누르면 연결된 **모든 모니터에** 각각 전체 장면으로 깔립니다.
-
-![sunset_clouds 씬 + 설정 패널](docs/screenshots/scene_sunset.png)
-
-**Shadertoy GLSL** — `shaders/plasma.glsl`을 수정 없이 로드 (naga GLSL 프론트엔드)
-
-![Shadertoy plasma 셰이더](docs/screenshots/shadertoy_plasma.png)
-
 > 실측 환경: Windows 11 · NVIDIA RTX 3060 · Vulkan 백엔드 · 4모니터 동시 부착.
+
+## 🎬 씬 갤러리 (v1.1 판매급 리마스터)
+
+기본 제공 씬 8종 전부 이번 릴리즈에서 전면 리워크했습니다. 일부 GPU에서 화면 전체에
+사각 블록 아티팩트를 일으키던 fp32 sin 정밀도 붕괴 버그(해시 함수 재작성)를 근본
+해결하고, HDR 노출 예산과 아트를 씬마다 다시 잡았습니다.
+
+| | |
+|---|---|
+| **기본 (오로라)** — 3겹 물결 커튼·세로 광선, 은하수, 3층 별(회절 스파이크), 산 실루엣 + 호수 반영, 라운드캡 EQ | ![aurora](docs/screenshots/scenes/aurora.png) |
+| **ocean** — 골든아워 바다, Fresnel 하늘 반사, 원근 스웰, 태양 글리터 기둥(원근 보정 스파클) | ![ocean](docs/screenshots/scenes/ocean.png) |
+| **sunset_clouds** — 역광 구름 3층 + 실버라이닝, 갓레이, 초저녁 별 | ![sunset_clouds](docs/screenshots/scenes/sunset_clouds.png) |
+| **mountains** — 황혼 능선 6겹 + 골짜기 안개, 능선 위 태양, 유성 | ![mountains](docs/screenshots/scenes/mountains.png) |
+| **rain** — "유리창의 비": 보케 야경 + 흘러내리는 물방울 렌즈(굴절) + 빗줄기 + 번개 | ![rain](docs/screenshots/scenes/rain.png) |
+| **forest_fireflies** — 달무리 + 볼류메트릭 문라이트 + 침엽수 3겹 + 깊이별 반딧불 | ![forest_fireflies](docs/screenshots/scenes/forest_fireflies.png) |
+| **plasma** — 실크 잉크 유체(네이비→틸→오키드→골드 큐레이션 램프), 순수 Shadertoy(iTime/iResolution만) | ![plasma](docs/screenshots/scenes/plasma.png) |
+| **audio_bars** — 네온 스펙트럼 링 + 미러 바닥 + 베이스 코어 + 무음 idle 브리딩 | ![audio_bars](docs/screenshots/scenes/audio_bars.png) |
 
 ## 🚀 빠른 시작
 
@@ -95,6 +103,8 @@ cargo run --release -- --stop
 | `--ssaa <f32>` | `1.5` | 슈퍼샘플 AA 배율 (1.0=끔, 2.0=최상, 부하↑) |
 | `--watch` | `false` | 셰이더 파일 핫리로드 |
 | `--width`/`--height` | `1280`/`720` | preview 창 크기 |
+| `--screenshot <path>` | — | 창 없이 오프스크린 렌더(HDR 포스트FX 포함) 후 지정 경로에 PNG 저장하고 종료. 씬 QA·README 스크린샷 갱신용 |
+| `--sim-time <sec>` | `20.0` | `--screenshot`에서 사용할 시뮬레이션 `iTime`(오디오는 무음으로 렌더) |
 
 ## 🎨 셰이더 작성 (Shadertoy 호환)
 
@@ -123,18 +133,19 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 ### 🌊 기본 제공 씬
 
-`shaders/` 폴더의 `.glsl`은 설정 GUI 드롭다운에 자동으로 나타납니다.
+`shaders/` 폴더의 `.glsl`은 설정 GUI 드롭다운에 자동으로 나타납니다. 미리보기는
+위 [씬 갤러리](#-씬-갤러리-v11-판매급-리마스터) 참고.
 
 | 씬 | 설명 |
 |---|---|
-| 기본 (오로라) | 오로라 + 별 + 64밴드 스펙트럼 이퀄라이저 (WGSL) |
-| `ocean` | 황혼의 바다 + 태양 글리터 반짝임 (bass·treble 반응) |
-| `sunset_clouds` | 노을 하늘 + 도메인워프 fbm 구름 + 태양 후광 (treble 반응) |
-| `mountains` | 해질녘 다층 산 실루엣 (안개 원근·안티에일리어싱) + 반짝이는 별 |
-| `rain` | 다층 빗줄기 + bass에 번쩍이는 번개 섬광 |
-| `forest_fireflies` | 안개 낀 숲의 반딧불 (volume 반응) |
-| `plasma` | 클래식 Shadertoy 플라즈마 |
-| `audio_bars` | 오디오 스펙트럼 바 |
+| 기본 (오로라) | 물결 커튼·은하수·회절 스파이크 별·호수 반영 + 64밴드 스펙트럼 이퀄라이저 (WGSL) |
+| `ocean` | 골든아워 바다, Fresnel 하늘 반사 + 태양 글리터 기둥 (bass·treble 반응) |
+| `sunset_clouds` | 역광 구름 3층 + 실버라이닝, 갓레이, 초저녁 별 (treble 반응) |
+| `mountains` | 황혼 능선 6겹 + 골짜기 안개, 능선 위 태양, 유성 |
+| `rain` | "유리창의 비" — 보케 야경 + 굴절되는 물방울 렌즈 + 빗줄기, bass에 번쩍이는 번개 |
+| `forest_fireflies` | 달무리 + 볼류메트릭 문라이트 + 침엽수 3겹 + 깊이별 반딧불 (volume 반응) |
+| `plasma` | 실크 잉크 유체 — 네이비→틸→오키드→골드 큐레이션 램프 (순수 Shadertoy) |
+| `audio_bars` | 네온 스펙트럼 링 + 미러 바닥 + 베이스 코어 (무음 idle 브리딩) |
 
 ## 🧭 아키텍처
 

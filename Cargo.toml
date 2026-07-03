@@ -1,6 +1,6 @@
 [package]
 name = "real_live_wall"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["BaeTab <bhwoo48@gmail.com>"]
@@ -24,6 +24,8 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
+# PNG output for the headless --screenshot QA path
+png = "0.17"
 # Settings persistence (%APPDATA%/real_live_wall/config.toml)
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
