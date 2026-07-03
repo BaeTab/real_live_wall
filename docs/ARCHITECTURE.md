@@ -52,6 +52,9 @@
 | `reactive.rs` | sysinfo CPU/메모리 샘플링 |
 | `ui.rs` | egui 설정 패널(씬/오디오/게인/미터/월페이퍼 적용), 셰이더 위에 합성 |
 | `platform.rs` | 월페이퍼 표면 획득 — Windows `WorkerW` 모니터별 부착, 네임드 이벤트 기반 원격 종료, 바탕화면 복구, mac/linux 스텁 |
+| `persist.rs` | 설정 영속화 — `%APPDATA%/real_live_wall/config.toml` (serde+toml) 로드/저장 |
+| `tray.rs` | 시스템 트레이 아이콘 + 팝업 메뉴 (전용 스레드·메시지 루프, `Shell_NotifyIconW`) |
+| `startup.rs` | 로그인 자동 시작 — HKCU Run 레지스트리 키 등록/해제 |
 
 ## uniform 계약
 
@@ -100,6 +103,22 @@ Shadertoy 셰이더는 `shader.rs`의 래퍼가 위 블록을 `#define iResoluti
 - **macOS**(예정): 각 스크린마다 `kCGDesktopWindowLevel` NSWindow.
 - **Linux**(예정): X11 루트/데스크톱 타입, Wayland는 `wlr-layer-shell`.
 
+## 설정 영속화 · 트레이 · 자동 시작
+
+- **영속화(`persist.rs`)**: preview 프로세스가 `config.toml`을 로드해 GUI 초기 상태(씬/
+  오디오/게인/SSAA)를 복원하고, 설정 변경·종료 시 저장한다. CLI로 명시한 값(clap 기본값과
+  다른 값)은 저장값보다 우선. wallpaper 프로세스는 명시적 인자로 실행되므로 저장하지 않는다.
+- **트레이(`tray.rs`)**: wallpaper 프로세스가 **전용 스레드**에 message-only 창 + 메시지
+  루프를 띄우고 `Shell_NotifyIconW`로 아이콘을 등록한다. 메뉴 선택(WM_COMMAND)은
+  `TrayCommand`로 매핑돼 `EventLoopProxy<AppEvent>::send_event(AppEvent::Tray(..))`로
+  메인 루프에 전달된다. "다음 씬"은 공유 렌더러의 셰이더를 교체(전 모니터 반영), "설정 열기"는
+  preview 프로세스를 새로 스폰.
+- **자동 시작(`startup.rs`)**: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`에
+  현재 씬을 재현하는 커맨드(exe + `--mode wallpaper --shader ... --audio ... --gain ...`)를
+  `REG_SZ`로 등록/해제.
+- **단일 인스턴스**: wallpaper 시작 시 `platform::wallpaper_running()`(stop 이벤트 존재
+  여부)로 이미 실행 중이면 즉시 종료.
+
 ## 월페이퍼 생명주기 / 원격 종료
 
 프리뷰의 **"바탕화면에 적용"**은 자기 exe를 `--mode wallpaper`로 **별도 프로세스** 스폰한다.
@@ -114,6 +133,7 @@ Shadertoy 셰이더는 `shader.rs`의 래퍼가 위 블록을 `#define iResoluti
 ## 로드맵 (엔진 강화 방향)
 
 - [x] 멀티모니터 — 모니터마다 전체 장면 개별 렌더 (완료)
+- [x] 트레이 · 자동 시작 · 설정 저장 · 단일 인스턴스 (v1.0)
 - [ ] 모니터별 씬 개별 선택
 - [ ] Shadertoy `iChannel0` 오디오 텍스처 완전 호환 (현재는 uniform 스펙트럼)
 - [ ] 멀티패스(버퍼) 셰이더 그래프

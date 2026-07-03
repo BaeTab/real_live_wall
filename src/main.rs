@@ -12,11 +12,14 @@ mod app;
 mod audio;
 mod config;
 mod gpu;
+mod persist;
 mod platform;
 mod postfx;
 mod reactive;
 mod renderer;
 mod shader;
+mod startup;
+mod tray;
 mod ui;
 mod uniforms;
 
@@ -38,6 +41,12 @@ fn main() -> anyhow::Result<()> {
         } else {
             log::info!("no running wallpaper found");
         }
+        return Ok(());
+    }
+
+    // Only one wallpaper process at a time (guards autostart + double-launch).
+    if config.mode == Mode::Wallpaper && platform::wallpaper_running() {
+        log::info!("a wallpaper is already running; exiting");
         return Ok(());
     }
 

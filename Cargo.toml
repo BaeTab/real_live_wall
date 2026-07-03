@@ -1,6 +1,6 @@
 [package]
 name = "real_live_wall"
-version = "0.4.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["BaeTab <bhwoo48@gmail.com>"]
@@ -24,6 +24,9 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
+# Settings persistence (%APPDATA%/real_live_wall/config.toml)
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 # GUI settings panel
 egui = "0.35"
 egui-wgpu = "0.35"
@@ -39,7 +42,10 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
     "Win32_Graphics_Gdi",
 ] }
 

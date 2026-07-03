@@ -3,6 +3,25 @@
 이 프로젝트의 주요 변경 사항을 기록합니다. 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/),
 버전은 [Semantic Versioning](https://semver.org/lang/ko/)을 따릅니다.
 
+## [1.0.0] - 2026-07-03
+
+첫 정식 릴리즈 — "매일 쓰는 완성품" 수준의 제품 완성도.
+
+### 추가 (Added)
+- **시스템 트레이** — 월페이퍼 프로세스에 트레이 아이콘이 상주. 설정 창 없이도
+  **설정 열기 · 다음 씬 · 자동 시작 토글 · 종료**를 트레이 메뉴에서 제어. (전용 스레드 +
+  메시지 루프, `Shell_NotifyIconW`)
+- **로그인 자동 시작** — 설정 패널/트레이의 "자동 시작"으로 `HKCU\...\Run`에 등록/해제.
+  마지막 씬을 그대로 재현하는 커맨드로 등록된다.
+- **설정 저장** — 씬/오디오/게인/SSAA를 `%APPDATA%\real_live_wall\config.toml`에 자동
+  저장하고 재실행 시 복원(`serde` + `toml`). CLI로 명시한 값은 저장값보다 우선한다.
+- **단일 인스턴스 가드** — 월페이퍼는 한 번에 하나만 실행(중복 실행 방지).
+- 설정 패널에 **"로그인 시 자동 시작"** 체크박스 추가.
+
+### 변경 (Changed)
+- `shaders/` 디렉터리를 현재 경로뿐 아니라 실행 파일 옆에서도 탐색(릴리즈 zip·자동 시작
+  대응).
+
 ## [0.4.0] - 2026-07-03
 
 ### 추가 (Added)
@@ -44,6 +63,7 @@
 - 기본 WGSL 오로라 씬 + 64밴드 스펙트럼, Shadertoy GLSL(`mainImage`) 무수정 로드.
 - 실시간 오디오(FFT) · CPU/메모리 리액티브 입력, GLSL 핫리로드.
 
+[1.0.0]: https://github.com/BaeTab/real_live_wall/releases/tag/v1.0.0
 [0.4.0]: https://github.com/BaeTab/real_live_wall/releases/tag/v0.4.0
 [0.3.0]: https://github.com/BaeTab/real_live_wall/releases/tag/v0.3.0
 [0.2.0]: https://github.com/BaeTab/real_live_wall/releases/tag/v0.2.0

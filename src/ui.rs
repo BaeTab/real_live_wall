@@ -15,6 +15,7 @@ pub struct Settings {
     pub audio: AudioArg,
     pub gain: f32,
     pub panel_open: bool,
+    pub autostart: bool,
 }
 
 /// Live read-only values shown as meters.
@@ -38,6 +39,7 @@ pub enum UiAction {
     SelectScene(usize),
     SetAudio(AudioArg),
     ToggleWallpaper,
+    SetAutostart(bool),
     Reload,
     Quit,
 }
@@ -186,7 +188,14 @@ impl Ui {
                         actions.push(UiAction::ToggleWallpaper);
                     }
                     if meters.wallpaper_running {
-                        ui.weak("현재 씬이 데스크톱 배경으로 실행 중입니다.");
+                        ui.weak("현재 씬이 데스크톱 배경으로 실행 중입니다. (트레이 아이콘에서 제어)");
+                    }
+
+                    ui.add_space(6.0);
+                    let mut autostart = settings.autostart;
+                    if ui.checkbox(&mut autostart, "로그인 시 자동 시작").changed() {
+                        settings.autostart = autostart;
+                        actions.push(UiAction::SetAutostart(autostart));
                     }
 
                     ui.add_space(6.0);

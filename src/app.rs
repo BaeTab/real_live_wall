@@ -22,12 +22,15 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::audio::AudioEngine;
-use crate::config::{Config, Mode};
+use crate::config::{AudioArg, Config, Mode};
 use crate::gpu::{Gpu, GpuContext};
+use crate::persist::PersistConfig;
 use crate::platform::{self, MonitorRect};
 use crate::postfx::PostFx;
 use crate::reactive::Reactive;
 use crate::renderer::Renderer;
+use crate::startup;
+use crate::tray::{self, TrayCommand};
 use crate::ui::{Meters, Settings, Ui, UiAction};
 use crate::uniforms::Uniforms;
 
@@ -36,6 +39,8 @@ use crate::uniforms::Uniforms;
 pub enum AppEvent {
     /// Another instance asked this wallpaper process to exit.
     StopWallpaper,
+    /// A tray-menu action (wallpaper process only).
+    Tray(TrayCommand),
 }
 
 /// A selectable scene: the built-in WGSL aurora, or a Shadertoy GLSL file.
@@ -49,12 +54,31 @@ struct Scene {
     source: SceneSource,
 }
 
+/// Locate the `shaders/` directory: next to the current dir (dev / `cargo run`),
+/// else next to the executable (release zip, autostart from another cwd).
+fn shaders_dir() -> Option<PathBuf> {
+    let cwd = PathBuf::from("shaders");
+    if cwd.is_dir() {
+        return Some(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("shaders");
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 fn discover_scenes() -> Vec<Scene> {
     let mut scenes = vec![Scene {
         name: "기본 — 오로라 + 스펙트럼".to_string(),
         source: SceneSource::Builtin,
     }];
-    if let Ok(rd) = std::fs::read_dir("shaders") {
+    if let Some(dir) = shaders_dir() {
+        if let Ok(rd) = std::fs::read_dir(dir) {
         let mut files: Vec<PathBuf> = rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|x| x == "glsl").unwrap_or(false))
@@ -66,6 +90,7 @@ fn discover_scenes() -> Vec<Scene> {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "shader".to_string());
             scenes.push(Scene { name, source: SceneSource::Glsl(f) });
+        }
         }
     }
     scenes
@@ -128,6 +153,8 @@ struct State {
     reactive: Reactive,
     uniforms: Uniforms,
 
+    mode: Mode,
+    ssaa: f32,
     ui: Option<Ui>,
     settings: Settings,
     scenes: Vec<Scene>,
@@ -135,6 +162,8 @@ struct State {
     wallpaper_child: Option<Child>,
     // Keeps the wallpaper stop-watcher thread's ownership marker alive.
     _stop_guard: Option<platform::StopGuard>,
+    // Keeps the system-tray thread alive (wallpaper process only).
+    _tray: Option<tray::TrayHandle>,
 
     start: Instant,
     last_frame: Instant,
@@ -167,6 +196,11 @@ impl ApplicationHandler<AppEvent> for App {
                 log::info!("exiting on stop request");
                 event_loop.exit();
             }
+            AppEvent::Tray(cmd) => {
+                if let Some(state) = self.state.as_mut() {
+                    state.on_tray(cmd, event_loop);
+                }
+            }
         }
     }
 
@@ -193,7 +227,10 @@ impl ApplicationHandler<AppEvent> for App {
         };
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                state.save_prefs();
+                event_loop.exit();
+            }
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
@@ -202,6 +239,7 @@ impl ApplicationHandler<AppEvent> for App {
                             state.settings.panel_open = !state.settings.panel_open;
                         }
                         PhysicalKey::Code(KeyCode::Escape) if self.config.mode == Mode::Preview => {
+                            state.save_prefs();
                             event_loop.exit();
                         }
                         _ => {}
@@ -269,10 +307,29 @@ fn build_state(
     // --- shared gpu + scene renderer (from the first window) ----------------
     let (ctx, gpu0) = GpuContext::new(specs[0].window.clone())?;
     let mut renderer = Renderer::new(&gpu0)?;
-    let ssaa = config.ssaa.clamp(1.0, 2.0);
+
+    // --- merge persisted preferences (preview only) with CLI overrides ------
+    let persisted = if config.mode == Mode::Preview {
+        PersistConfig::load()
+    } else {
+        PersistConfig::default()
+    };
+    // Explicit CLI values (i.e. not the clap default) win; else use persisted.
+    let gain = if config.gain != 6.0 { config.gain } else { persisted.gain };
+    let audio_arg = if config.audio != AudioArg::Auto {
+        config.audio
+    } else {
+        AudioArg::from_cli(&persisted.audio)
+    };
+    let ssaa = (if config.ssaa != 1.5 { config.ssaa } else { persisted.ssaa }).clamp(1.0, 2.0);
 
     // --- scenes + initial selection -----------------------------------------
-    let (scenes, scene_index) = select_scenes(config);
+    let preferred = if config.shader.is_none() {
+        persisted.scene.as_deref()
+    } else {
+        None
+    };
+    let (scenes, scene_index) = select_scenes(config, preferred);
     let shader_path = load_scene(&gpu0, &mut renderer, &scenes[scene_index]);
     let scene_names = scenes.iter().map(|s| s.name.clone()).collect();
 
@@ -286,8 +343,9 @@ fn build_state(
         monitors.push(MonitorTarget { window: spec.window.clone(), gpu, postfx });
     }
 
-    // --- wallpaper attach + remote-stop watcher -----------------------------
+    // --- wallpaper attach + remote-stop watcher + system tray ---------------
     let mut stop_guard = None;
+    let mut tray_handle = None;
     if config.mode == Mode::Wallpaper {
         for (spec, target) in specs.iter().zip(monitors.iter()) {
             if let Some(rect) = spec.rect {
@@ -296,16 +354,28 @@ fn build_state(
                 }
             }
         }
-        let proxy = proxy.clone();
+        let proxy_stop = proxy.clone();
         stop_guard = platform::watch_for_stop(move || {
-            let _ = proxy.send_event(AppEvent::StopWallpaper);
+            let _ = proxy_stop.send_event(AppEvent::StopWallpaper);
         });
+        // Tray icon lives in the (persistent) wallpaper process: control it
+        // without keeping a settings window open.
+        let proxy_tray = proxy.clone();
+        match tray::spawn(
+            startup::autostart_enabled(),
+            Box::new(move |cmd| {
+                let _ = proxy_tray.send_event(AppEvent::Tray(cmd));
+            }),
+        ) {
+            Ok(h) => tray_handle = Some(h),
+            Err(e) => log::warn!("tray disabled: {e:#}"),
+        }
     }
 
     // --- audio --------------------------------------------------------------
-    let audio = config
-        .audio_source()
-        .map(|src| AudioEngine::new(src, config.gain));
+    let audio = audio_arg
+        .to_source()
+        .map(|src| AudioEngine::new(src, gain));
 
     // --- optional hot-reload watcher ----------------------------------------
     let (mut watcher, mut watch_rx) = (None, None);
@@ -336,17 +406,21 @@ fn build_state(
         audio,
         reactive: Reactive::new(),
         uniforms: Uniforms::default(),
+        mode: config.mode,
+        ssaa,
         ui,
         settings: Settings {
             scene: scene_index,
-            audio: config.audio,
-            gain: config.gain,
+            audio: audio_arg,
+            gain,
             panel_open: config.mode == Mode::Preview,
+            autostart: startup::autostart_enabled(),
         },
         scenes,
         scene_names,
         wallpaper_child: None,
         _stop_guard: stop_guard,
+        _tray: tray_handle,
         start: now,
         last_frame: now,
         frame: 0,
@@ -415,8 +489,9 @@ fn create_windows(config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Resu
     Ok(specs)
 }
 
-/// Discover scenes and resolve the initial selection from `--shader`.
-fn select_scenes(config: &Config) -> (Vec<Scene>, usize) {
+/// Discover scenes and resolve the initial selection: `--shader` wins, then a
+/// `preferred` scene name (e.g. the persisted last selection), else the default.
+fn select_scenes(config: &Config, preferred: Option<&str>) -> (Vec<Scene>, usize) {
     let mut scenes = discover_scenes();
     let mut scene_index = 0usize;
     if let Some(path) = &config.shader {
@@ -433,6 +508,10 @@ fn select_scenes(config: &Config) -> (Vec<Scene>, usize) {
                 .unwrap_or_else(|| "custom".to_string());
             scenes.push(Scene { name, source: SceneSource::Glsl(path.clone()) });
             scene_index = scenes.len() - 1;
+        }
+    } else if let Some(name) = preferred {
+        if let Some(pos) = scenes.iter().position(|s| s.name == name) {
+            scene_index = pos;
         }
     }
     (scenes, scene_index)
@@ -610,6 +689,7 @@ impl State {
                 if let Some(scene) = self.scenes.get(i) {
                     self.shader_path = load_scene(&self.monitors[0].gpu, &mut self.renderer, scene);
                 }
+                self.save_prefs();
             }
             UiAction::Reload => {
                 if let Some(scene) = self.scenes.get(self.settings.scene) {
@@ -619,10 +699,109 @@ impl State {
             UiAction::SetAudio(a) => {
                 self.settings.audio = a;
                 self.audio = a.to_source().map(|src| AudioEngine::new(src, self.settings.gain));
+                self.save_prefs();
             }
             UiAction::ToggleWallpaper => self.toggle_wallpaper(),
-            UiAction::Quit => event_loop.exit(),
+            UiAction::SetAutostart(on) => {
+                let cmd = self.autostart_command();
+                match startup::set_autostart(on, &cmd) {
+                    Ok(()) => self.settings.autostart = on,
+                    Err(e) => log::error!("autostart toggle failed: {e:#}"),
+                }
+                self.save_prefs();
+            }
+            UiAction::Quit => {
+                self.save_prefs();
+                event_loop.exit();
+            }
         }
+    }
+
+    /// Route a tray-menu command (wallpaper process).
+    fn on_tray(&mut self, cmd: TrayCommand, event_loop: &ActiveEventLoop) {
+        match cmd {
+            TrayCommand::OpenSettings => self.open_settings(),
+            TrayCommand::NextScene => self.cycle_scene(),
+            TrayCommand::ToggleAutostart => self.toggle_autostart(),
+            TrayCommand::Quit => event_loop.exit(),
+        }
+    }
+
+    /// Spawn a fresh preview/settings window process.
+    fn open_settings(&self) {
+        if let Ok(exe) = std::env::current_exe() {
+            match std::process::Command::new(exe).arg("--mode").arg("preview").spawn() {
+                Ok(_) => log::info!("opened settings window"),
+                Err(e) => log::error!("failed to open settings: {e}"),
+            }
+        }
+    }
+
+    /// Advance to the next scene (used by the tray in wallpaper mode). The scene
+    /// renderer is shared, so one load applies to every monitor.
+    fn cycle_scene(&mut self) {
+        if self.scenes.is_empty() {
+            return;
+        }
+        self.settings.scene = (self.settings.scene + 1) % self.scenes.len();
+        if let Some(scene) = self.scenes.get(self.settings.scene) {
+            self.shader_path = load_scene(&self.monitors[0].gpu, &mut self.renderer, scene);
+            log::info!("tray: scene → {}", self.scene_names.get(self.settings.scene).map(|s| s.as_str()).unwrap_or("?"));
+        }
+    }
+
+    /// The command line that autostart should run to reproduce the current scene.
+    fn autostart_command(&self) -> String {
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "real_live_wall.exe".to_string());
+        let mut cmd = format!("\"{exe}\" --mode wallpaper");
+        if let Some(scene) = self.scenes.get(self.settings.scene) {
+            if let SceneSource::Glsl(p) = &scene.source {
+                let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                cmd.push_str(&format!(" --shader \"{}\"", abs.display()));
+            }
+        }
+        cmd.push_str(&format!(
+            " --audio {} --gain {} --ssaa {}",
+            self.settings.audio.as_cli(),
+            self.settings.gain,
+            self.ssaa
+        ));
+        cmd
+    }
+
+    fn toggle_autostart(&mut self) {
+        let enable = !startup::autostart_enabled();
+        let cmd = self.autostart_command();
+        match startup::set_autostart(enable, &cmd) {
+            Ok(()) => {
+                self.settings.autostart = enable;
+                log::info!("autostart {}", if enable { "enabled" } else { "disabled" });
+            }
+            Err(e) => log::error!("autostart toggle failed: {e:#}"),
+        }
+        self.save_prefs();
+    }
+
+    /// Persist the current preferences (preview process only — the wallpaper
+    /// process is launched with explicit args and must not overwrite them).
+    fn save_prefs(&self) {
+        if self.mode != Mode::Preview {
+            return;
+        }
+        let scene = self.scenes.get(self.settings.scene).and_then(|s| match s.source {
+            SceneSource::Builtin => None,
+            SceneSource::Glsl(_) => Some(s.name.clone()),
+        });
+        PersistConfig {
+            scene,
+            audio: self.settings.audio.as_cli().to_string(),
+            gain: self.settings.gain,
+            ssaa: self.ssaa,
+            autostart: startup::autostart_enabled(),
+        }
+        .save();
     }
 
     fn toggle_wallpaper(&mut self) {

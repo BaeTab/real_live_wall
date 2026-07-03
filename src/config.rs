@@ -41,6 +41,16 @@ impl AudioArg {
             AudioArg::Off => "off",
         }
     }
+
+    /// Parse the `as_cli` name back (used for persisted settings). Unknown → Auto.
+    pub fn from_cli(s: &str) -> AudioArg {
+        match s {
+            "input" => AudioArg::Input,
+            "loopback" => AudioArg::Loopback,
+            "off" => AudioArg::Off,
+            _ => AudioArg::Auto,
+        }
+    }
 }
 
 /// Reactive, cross-platform live wallpaper engine.
@@ -87,10 +97,4 @@ pub struct Config {
     /// Preview window height (ignored in wallpaper mode).
     #[arg(long, default_value_t = 720)]
     pub height: u32,
-}
-
-impl Config {
-    pub fn audio_source(&self) -> Option<AudioSource> {
-        self.audio.to_source()
-    }
 }
