@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Editors / IDEs
+/.vs/
+.vscode/
+.idea/
+*.user
+
+# Leftover Visual Studio C# scaffold (superseded by the Rust engine)
+*.sln
+*.csproj
+*.csproj.user
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs / captures scratch
+*.log
+/captures/

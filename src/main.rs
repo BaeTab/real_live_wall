@@ -1,0 +1,33 @@
+//! real_live_wall — a reactive, cross-platform live wallpaper engine.
+//!
+//! Draws a full-screen shader (built-in WGSL scene or a Shadertoy GLSL file)
+//! that reacts in real time to system audio, CPU/memory load and the clock,
+//! either in a preview window or as the live desktop wallpaper.
+
+mod app;
+mod audio;
+mod config;
+mod gpu;
+mod platform;
+mod reactive;
+mod renderer;
+mod shader;
+mod uniforms;
+
+use clap::Parser;
+use winit::event_loop::{ControlFlow, EventLoop};
+
+fn main() -> anyhow::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let config = config::Config::parse();
+    log::info!("real_live_wall starting ({:?} mode)", config.mode);
+
+    let event_loop = EventLoop::new()?;
+    // Continuous animation: keep pumping frames.
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let mut app = app::App::new(config);
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}

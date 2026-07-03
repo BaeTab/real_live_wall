@@ -1,0 +1,40 @@
+[package]
+name = "real_live_wall"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["BaeTab <bhwoo48@gmail.com>"]
+description = "Reactive cross-platform live wallpaper engine (wgpu) with Shadertoy GLSL support and real-time audio reactivity"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/BaeTab/real_live_wall"
+readme = "README.md"
+
+[dependencies]
+wgpu = { version = "30", features = ["glsl", "wgsl"] }
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+cpal = "0.18"
+rustfft = "6"
+sysinfo = "0.39"
+notify = "9.0.0-rc.4"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Faster iterative debug builds of the heavy graphics stack.
+[profile.dev.package."*"]
+opt-level = 2
