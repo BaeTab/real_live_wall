@@ -76,6 +76,10 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub top: bool,
 
+    /// Signal any running wallpaper process to stop, then exit immediately.
+    #[arg(long, default_value_t = false)]
+    pub stop: bool,
+
     /// Preview window width (ignored in wallpaper mode).
     #[arg(long, default_value_t = 1280)]
     pub width: u32,

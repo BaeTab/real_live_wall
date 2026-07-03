@@ -40,10 +40,10 @@
 
 | 파일 | 역할 |
 |---|---|
-| `main.rs` | CLI 파싱, winit 이벤트 루프 부팅 |
-| `config.rs` | clap 기반 실행 옵션 (`--mode`, `--shader`, `--audio`, `--gain`, `--watch`) |
-| `app.rs` | `ApplicationHandler`: 창 생명주기, 프레임 루프, 입력, 핫리로드 |
-| `gpu.rs` | wgpu 인스턴스/어댑터/디바이스/서피스 부트스트랩, 리사이즈 |
+| `main.rs` | CLI 파싱, `--stop` 조기 처리, user-event winit 루프 부팅, 종료 시 바탕화면 복구 |
+| `config.rs` | clap 기반 실행 옵션 (`--mode`, `--shader`, `--audio`, `--gain`, `--watch`, `--stop`) |
+| `app.rs` | `ApplicationHandler<AppEvent>`: 멀티모니터 창 생명주기, 프레임 루프, 입력, 핫리로드, 월페이퍼 스폰/종료 |
+| `gpu.rs` | `GpuContext`(device/queue 공유) + 창별 `Gpu`(surface). 여러 모니터가 한 디바이스 공유 |
 | `renderer.rs` | uniform 버퍼·바인드그룹·파이프라인 소유, 셰이더 핫스왑, HDR 씬 패스 |
 | `postfx.rs` | HDR 오프스크린 → bright-pass → 가우시안 블룸(핑퐁) → ACES 톤매핑+비네트 합성 |
 | `shader.rs` | 풀스크린 WGSL 버텍스, 기본 WGSL 씬, **Shadertoy→GLSL 래퍼** |
@@ -51,7 +51,7 @@
 | `audio.rs` | cpal 캡처(루프백 우선) + rustfft 스펙트럼 분석, graceful fallback |
 | `reactive.rs` | sysinfo CPU/메모리 샘플링 |
 | `ui.rs` | egui 설정 패널(씬/오디오/게인/미터/월페이퍼 적용), 셰이더 위에 합성 |
-| `platform.rs` | 월페이퍼 표면 획득 — Windows `WorkerW` 부착, mac/linux 스텁 |
+| `platform.rs` | 월페이퍼 표면 획득 — Windows `WorkerW` 모니터별 부착, 네임드 이벤트 기반 원격 종료, 바탕화면 복구, mac/linux 스텁 |
 
 ## uniform 계약
 
@@ -82,18 +82,39 @@ Shadertoy 셰이더는 `shader.rs`의 래퍼가 위 블록을 `#define iResoluti
   라이트·글로우를 살려 "프리미엄" 룩을 만든다.
 - egui 패널은 합성 결과 위에 `LoadOp::Load`로 그린다.
 
+## 멀티모니터 렌더링
+
+월페이퍼 모드는 `ActiveEventLoop::available_monitors()`로 **모니터마다 borderless 창 1개**를
+만든다. 각 창은 자기 `wgpu::Surface`와 후처리 체인(`PostFx`)을 갖지만, **디바이스/큐와 씬
+`Renderer`(파이프라인 + uniform 버퍼)는 전체가 하나를 공유**한다. 한 프레임에서 모니터별로
+`update_uniforms`(해상도/종횡비 갱신) → `submit` 순서가 큐에서 보장되므로, 유니폼 버퍼 하나를
+재사용해도 각 모니터가 자기 해상도로 그려진다. 프레임 루프는 primary 창의 `RedrawRequested`
+하나에서 전 모니터를 그린다(`about_to_wait`는 primary만 `request_redraw`).
+
 ## 플랫폼별 월페이퍼 표면
 
 - **Windows**: `Progman`에 `0x052C` 메시지 → `WorkerW` 생성 → `EnumWindows`(+Win11
-  폴백)로 찾아 `SetParent(우리 창, WorkerW)`. 이후 `SetWindowPos`로 **주 모니터에 정확히
-  꽉 차게**(가상 데스크톱 좌표 보정) + `HWND_BOTTOM`으로 아이콘 뒤에 배치. (멀티모니터
-  개별 씬은 예정)
+  폴백)로 찾아 각 창을 `SetParent(창, WorkerW)`. 이후 `SetWindowPos`로 **각 모니터 사각형에
+  정확히 꽉 차게**(WorkerW client 원점 = 가상 데스크톱 좌상단이므로 `(rect.x-SM_XVIRTUALSCREEN,
+  rect.y-SM_YVIRTUALSCREEN)`) + `HWND_BOTTOM`으로 아이콘 뒤에 배치.
 - **macOS**(예정): 각 스크린마다 `kCGDesktopWindowLevel` NSWindow.
 - **Linux**(예정): X11 루트/데스크톱 타입, Wayland는 `wlr-layer-shell`.
 
+## 월페이퍼 생명주기 / 원격 종료
+
+프리뷰의 **"바탕화면에 적용"**은 자기 exe를 `--mode wallpaper`로 **별도 프로세스** 스폰한다.
+프리뷰 창을 닫으면 자식 핸들이 사라져 못 끄던 문제를 없애기 위해, 월페이퍼 프로세스는
+**세션-로컬 네임드 이벤트**(auto-reset)를 등록하고 워커 스레드가 이를 대기한다. 어느
+인스턴스든 `--stop`(= `OpenEvent`+`SetEvent`) 또는 패널 버튼이 이벤트를 신호하면, 워커
+스레드가 `EventLoopProxy<AppEvent>::send_event(StopWallpaper)`로 루프를 깨워
+`event_loop.exit()`. 실행 여부는 이벤트를 `OpenEvent`해 보는 것으로 감지한다. 프로세스가
+빠져나오면 `main`이 `SPI_GETDESKWALLPAPER`→`SPI_SETDESKWALLPAPER`로 정적 바탕화면을
+리페인트해 잔상(검은 영역)을 없앤다.
+
 ## 로드맵 (엔진 강화 방향)
 
-- [ ] 멀티모니터 개별 씬
+- [x] 멀티모니터 — 모니터마다 전체 장면 개별 렌더 (완료)
+- [ ] 모니터별 씬 개별 선택
 - [ ] Shadertoy `iChannel0` 오디오 텍스처 완전 호환 (현재는 uniform 스펙트럼)
 - [ ] 멀티패스(버퍼) 셰이더 그래프
 - [ ] 날씨/캘린더/알림 리액티브 소스

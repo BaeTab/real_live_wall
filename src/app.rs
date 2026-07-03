@@ -1,6 +1,11 @@
 //! The winit application: window lifecycle, the per-frame update/render loop,
 //! input, audio/system sampling, the egui settings panel, GLSL hot-reload and
 //! spawning a detached wallpaper process.
+//!
+//! In wallpaper mode one borderless window is created per monitor (each with its
+//! own surface + post-processing chain, all sharing a single GPU device) so the
+//! same scene is drawn full-frame on every screen. The whole fleet is driven from
+//! a single frame loop keyed off the first window's redraw.
 
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -12,18 +17,26 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::audio::AudioEngine;
 use crate::config::{Config, Mode};
-use crate::gpu::Gpu;
+use crate::gpu::{Gpu, GpuContext};
+use crate::platform::{self, MonitorRect};
 use crate::postfx::PostFx;
 use crate::reactive::Reactive;
 use crate::renderer::Renderer;
 use crate::ui::{Meters, Settings, Ui, UiAction};
 use crate::uniforms::Uniforms;
+
+/// Events delivered to the loop from outside the winit thread.
+#[derive(Debug, Clone, Copy)]
+pub enum AppEvent {
+    /// Another instance asked this wallpaper process to exit.
+    StopWallpaper,
+}
 
 /// A selectable scene: the built-in WGSL aurora, or a Shadertoy GLSL file.
 enum SceneSource {
@@ -60,20 +73,57 @@ fn discover_scenes() -> Vec<Scene> {
 
 pub struct App {
     config: Config,
+    proxy: EventLoopProxy<AppEvent>,
     state: Option<State>,
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
-        Self { config, state: None }
+    pub fn new(config: Config, proxy: EventLoopProxy<AppEvent>) -> Self {
+        Self { config, proxy, state: None }
+    }
+}
+
+/// One monitor's render surface: its own window, swapchain and post-processing
+/// chain. The scene [`Renderer`] (pipeline + uniform buffer) is shared across all
+/// targets; uniforms are re-written per target just before its submit.
+struct MonitorTarget {
+    window: Arc<Window>,
+    gpu: Gpu,
+    postfx: PostFx,
+}
+
+impl MonitorTarget {
+    fn resize(&mut self, width: u32, height: u32) {
+        self.gpu.resize(width, height);
+        self.postfx.resize(&self.gpu, width, height);
+    }
+
+    /// Draw the scene (no GUI) for this monitor. `uniforms` must already be
+    /// filled for this monitor's scene resolution.
+    fn render(&mut self, renderer: &Renderer, uniforms: &Uniforms) {
+        renderer.update_uniforms(&self.gpu, uniforms);
+        let Some(frame) = self.gpu.acquire() else {
+            return;
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rlw-encoder") });
+        renderer.draw_scene(&self.gpu, self.postfx.scene_view(), &mut encoder);
+        self.postfx.render(&mut encoder, &view);
+        self.gpu.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
     }
 }
 
 struct State {
-    window: Arc<Window>,
-    gpu: Gpu,
+    // Kept alive for the lifetime of every surface it created.
+    _ctx: GpuContext,
+    monitors: Vec<MonitorTarget>,
     renderer: Renderer,
-    postfx: PostFx,
     audio: Option<AudioEngine>,
     reactive: Reactive,
     uniforms: Uniforms,
@@ -83,6 +133,8 @@ struct State {
     scenes: Vec<Scene>,
     scene_names: Vec<String>,
     wallpaper_child: Option<Child>,
+    // Keeps the wallpaper stop-watcher thread's ownership marker alive.
+    _stop_guard: Option<platform::StopGuard>,
 
     start: Instant,
     last_frame: Instant,
@@ -95,12 +147,12 @@ struct State {
     watch_rx: Option<Receiver<()>>,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
         }
-        match build_state(&self.config, event_loop) {
+        match build_state(&self.config, event_loop, &self.proxy) {
             Ok(state) => self.state = Some(state),
             Err(e) => {
                 log::error!("failed to initialise engine: {e:#}");
@@ -109,14 +161,33 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::StopWallpaper => {
+                log::info!("exiting on stop request");
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
 
-        // Let egui see the event first (it may want exclusive use of it).
-        let egui_consumed = if let Some(ui) = state.ui.as_mut() {
-            ui.on_window_event(state.window.as_ref(), &event)
+        let is_primary = state
+            .monitors
+            .first()
+            .map(|m| m.window.id() == id)
+            .unwrap_or(false);
+
+        // Let egui (preview-only, on the primary window) see the event first.
+        let egui_consumed = if is_primary {
+            if let Some(ui) = state.ui.as_mut() {
+                ui.on_window_event(state.monitors[0].window.as_ref(), &event)
+            } else {
+                false
+            }
         } else {
             false
         };
@@ -139,25 +210,28 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Resized(size) => {
-                state.gpu.resize(size.width, size.height);
-                state.postfx.resize(&state.gpu, size.width, size.height);
-                state.renderer.rebind(&state.gpu);
+                if let Some(i) = state.index_of(id) {
+                    state.monitors[i].resize(size.width, size.height);
+                    state.renderer.rebind(&state.monitors[i].gpu);
+                }
             }
 
-            WindowEvent::CursorMoved { position, .. } if !egui_consumed => {
-                let h = state.gpu.size.1 as f32;
+            WindowEvent::CursorMoved { position, .. } if is_primary && !egui_consumed => {
+                let h = state.monitors[0].gpu.size.1 as f32;
                 state.mouse[0] = position.x as f32;
                 state.mouse[1] = h - position.y as f32;
             }
 
             WindowEvent::MouseInput { state: btn, button, .. }
-                if !egui_consumed && button == MouseButton::Left && btn == ElementState::Pressed =>
+                if is_primary && !egui_consumed && button == MouseButton::Left && btn == ElementState::Pressed =>
             {
                 state.mouse[2] = state.mouse[0];
                 state.mouse[3] = state.mouse[1];
             }
 
-            WindowEvent::RedrawRequested => {
+            // The frame loop is driven off the primary window's redraw; it renders
+            // every monitor. Ignore redraws for the others.
+            WindowEvent::RedrawRequested if is_primary => {
                 let actions = state.render_frame();
                 for action in actions {
                     state.apply_action(action, event_loop);
@@ -170,69 +244,62 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = self.state.as_ref() {
-            state.window.request_redraw();
+            if let Some(primary) = state.monitors.first() {
+                primary.window.request_redraw();
+            }
         }
     }
 }
 
-fn build_state(config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Result<State> {
-    // --- window -------------------------------------------------------------
-    let mut attrs = Window::default_attributes().with_title("real_live_wall");
-    match config.mode {
-        Mode::Preview => {
-            attrs = attrs
-                .with_inner_size(PhysicalSize::new(config.width, config.height))
-                .with_resizable(true);
-            if config.top {
-                attrs = attrs.with_window_level(winit::window::WindowLevel::AlwaysOnTop);
-            }
-        }
-        Mode::Wallpaper => {
-            let size = event_loop
-                .primary_monitor()
-                .map(|m| m.size())
-                .unwrap_or(PhysicalSize::new(1920, 1080));
-            attrs = attrs
-                .with_inner_size(size)
-                .with_position(PhysicalPosition::new(0, 0))
-                .with_decorations(false)
-                .with_resizable(false);
-        }
-    }
-    let window = Arc::new(event_loop.create_window(attrs)?);
+/// Describes one window to create, plus (in wallpaper mode) the monitor rect it
+/// must be pinned to inside the desktop WorkerW layer.
+struct WinSpec {
+    window: Arc<Window>,
+    rect: Option<MonitorRect>,
+}
 
-    // --- gpu + renderer + post-processing -----------------------------------
-    let gpu = Gpu::new(window.clone())?;
-    let mut renderer = Renderer::new(&gpu)?;
-    let postfx = PostFx::new(&gpu, config.ssaa.clamp(1.0, 2.0));
+fn build_state(
+    config: &Config,
+    event_loop: &ActiveEventLoop,
+    proxy: &EventLoopProxy<AppEvent>,
+) -> anyhow::Result<State> {
+    // --- windows ------------------------------------------------------------
+    let specs = create_windows(config, event_loop)?;
+
+    // --- shared gpu + scene renderer (from the first window) ----------------
+    let (ctx, gpu0) = GpuContext::new(specs[0].window.clone())?;
+    let mut renderer = Renderer::new(&gpu0)?;
+    let ssaa = config.ssaa.clamp(1.0, 2.0);
 
     // --- scenes + initial selection -----------------------------------------
-    let mut scenes = discover_scenes();
-    let mut scene_index = 0usize;
-    if let Some(path) = &config.shader {
-        let canon = std::fs::canonicalize(path).ok();
-        if let Some(pos) = scenes.iter().position(|s| match &s.source {
-            SceneSource::Glsl(p) => std::fs::canonicalize(p).ok() == canon,
-            SceneSource::Builtin => false,
-        }) {
-            scene_index = pos;
-        } else {
-            let name = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "custom".to_string());
-            scenes.push(Scene { name, source: SceneSource::Glsl(path.clone()) });
-            scene_index = scenes.len() - 1;
-        }
-    }
-    let shader_path = load_scene(&gpu, &mut renderer, &scenes[scene_index]);
+    let (scenes, scene_index) = select_scenes(config);
+    let shader_path = load_scene(&gpu0, &mut renderer, &scenes[scene_index]);
     let scene_names = scenes.iter().map(|s| s.name.clone()).collect();
 
-    // --- wallpaper attach (only when this instance IS the wallpaper) --------
+    // --- one render target per window ---------------------------------------
+    let mut monitors = Vec::with_capacity(specs.len());
+    let postfx0 = PostFx::new(&gpu0, ssaa);
+    monitors.push(MonitorTarget { window: specs[0].window.clone(), gpu: gpu0, postfx: postfx0 });
+    for spec in &specs[1..] {
+        let gpu = ctx.create_gpu(spec.window.clone())?;
+        let postfx = PostFx::new(&gpu, ssaa);
+        monitors.push(MonitorTarget { window: spec.window.clone(), gpu, postfx });
+    }
+
+    // --- wallpaper attach + remote-stop watcher -----------------------------
+    let mut stop_guard = None;
     if config.mode == Mode::Wallpaper {
-        if let Err(e) = crate::platform::attach_to_desktop(&window) {
-            log::error!("wallpaper attach failed: {e:#}");
+        for (spec, target) in specs.iter().zip(monitors.iter()) {
+            if let Some(rect) = spec.rect {
+                if let Err(e) = platform::attach_to_desktop(target.window.as_ref(), rect) {
+                    log::error!("wallpaper attach failed: {e:#}");
+                }
+            }
         }
+        let proxy = proxy.clone();
+        stop_guard = platform::watch_for_stop(move || {
+            let _ = proxy.send_event(AppEvent::StopWallpaper);
+        });
     }
 
     // --- audio --------------------------------------------------------------
@@ -255,18 +322,17 @@ fn build_state(config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Result<
         }
     }
 
-    // --- egui settings panel (window/preview mode only) ---------------------
+    // --- egui settings panel (preview mode only, on the primary window) -----
     let ui = match config.mode {
-        Mode::Preview => Some(Ui::new(&gpu, window.as_ref())),
+        Mode::Preview => Some(Ui::new(&monitors[0].gpu, monitors[0].window.as_ref())),
         Mode::Wallpaper => None,
     };
 
     let now = Instant::now();
     Ok(State {
-        window,
-        gpu,
+        _ctx: ctx,
+        monitors,
         renderer,
-        postfx,
         audio,
         reactive: Reactive::new(),
         uniforms: Uniforms::default(),
@@ -280,6 +346,7 @@ fn build_state(config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Result<
         scenes,
         scene_names,
         wallpaper_child: None,
+        _stop_guard: stop_guard,
         start: now,
         last_frame: now,
         frame: 0,
@@ -289,6 +356,86 @@ fn build_state(config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Result<
         _watcher: watcher,
         watch_rx,
     })
+}
+
+/// Create the platform windows: one resizable preview window, or one borderless
+/// window per monitor in wallpaper mode.
+fn create_windows(config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Result<Vec<WinSpec>> {
+    let mut specs = Vec::new();
+    match config.mode {
+        Mode::Preview => {
+            let mut attrs = Window::default_attributes()
+                .with_title("real_live_wall")
+                .with_inner_size(PhysicalSize::new(config.width, config.height))
+                .with_resizable(true);
+            if config.top {
+                attrs = attrs.with_window_level(winit::window::WindowLevel::AlwaysOnTop);
+            }
+            let window = Arc::new(event_loop.create_window(attrs)?);
+            specs.push(WinSpec { window, rect: None });
+        }
+        Mode::Wallpaper => {
+            let monitors: Vec<_> = event_loop.available_monitors().collect();
+            for m in monitors {
+                let pos = m.position();
+                let size = m.size();
+                let rect = MonitorRect {
+                    x: pos.x,
+                    y: pos.y,
+                    w: size.width.max(1) as i32,
+                    h: size.height.max(1) as i32,
+                };
+                let attrs = Window::default_attributes()
+                    .with_title("real_live_wall")
+                    .with_inner_size(size)
+                    .with_position(pos)
+                    .with_decorations(false)
+                    .with_resizable(false);
+                let window = Arc::new(event_loop.create_window(attrs)?);
+                specs.push(WinSpec { window, rect: Some(rect) });
+            }
+            // Fallback: no enumerable monitors — one primary-sized window at (0,0).
+            if specs.is_empty() {
+                let size = event_loop
+                    .primary_monitor()
+                    .map(|m| m.size())
+                    .unwrap_or(PhysicalSize::new(1920, 1080));
+                let attrs = Window::default_attributes()
+                    .with_title("real_live_wall")
+                    .with_inner_size(size)
+                    .with_position(PhysicalPosition::new(0, 0))
+                    .with_decorations(false)
+                    .with_resizable(false);
+                let window = Arc::new(event_loop.create_window(attrs)?);
+                let rect = MonitorRect { x: 0, y: 0, w: size.width.max(1) as i32, h: size.height.max(1) as i32 };
+                specs.push(WinSpec { window, rect: Some(rect) });
+            }
+        }
+    }
+    Ok(specs)
+}
+
+/// Discover scenes and resolve the initial selection from `--shader`.
+fn select_scenes(config: &Config) -> (Vec<Scene>, usize) {
+    let mut scenes = discover_scenes();
+    let mut scene_index = 0usize;
+    if let Some(path) = &config.shader {
+        let canon = std::fs::canonicalize(path).ok();
+        if let Some(pos) = scenes.iter().position(|s| match &s.source {
+            SceneSource::Glsl(p) => std::fs::canonicalize(p).ok() == canon,
+            SceneSource::Builtin => false,
+        }) {
+            scene_index = pos;
+        } else {
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "custom".to_string());
+            scenes.push(Scene { name, source: SceneSource::Glsl(path.clone()) });
+            scene_index = scenes.len() - 1;
+        }
+    }
+    (scenes, scene_index)
 }
 
 /// Load a scene into the renderer, returning the GLSL path (for hot-reload).
@@ -323,6 +470,16 @@ fn make_watcher(path: &Path) -> anyhow::Result<(RecommendedWatcher, Receiver<()>
 }
 
 impl State {
+    fn index_of(&self, id: WindowId) -> Option<usize> {
+        self.monitors.iter().position(|m| m.window.id() == id)
+    }
+
+    /// Is a wallpaper currently live (our own child, or any process advertising
+    /// the stop event)?
+    fn wallpaper_active(&self) -> bool {
+        self.wallpaper_child.is_some() || platform::wallpaper_running()
+    }
+
     fn render_frame(&mut self) -> Vec<UiAction> {
         // --- timing ---------------------------------------------------------
         let now = Instant::now();
@@ -336,7 +493,7 @@ impl State {
         if let (Some(rx), Some(path)) = (self.watch_rx.as_ref(), self.shader_path.as_ref()) {
             if rx.try_iter().count() > 0 {
                 if let Ok(src) = std::fs::read_to_string(path) {
-                    match self.renderer.load_shadertoy_glsl(&self.gpu, &src) {
+                    match self.renderer.load_shadertoy_glsl(&self.monitors[0].gpu, &src) {
                         Ok(()) => log::info!("reloaded {}", path.display()),
                         Err(e) => log::error!("reload failed: {e:#}"),
                     }
@@ -351,7 +508,7 @@ impl State {
             }
         }
 
-        // --- reactive inputs ------------------------------------------------
+        // --- reactive inputs (sampled once for all monitors) ----------------
         if let Some(a) = self.audio.as_mut() {
             a.set_gain(self.settings.gain);
         }
@@ -360,67 +517,87 @@ impl State {
         let (cpu, mem) = self.reactive.poll();
         let sample_rate = self.audio.as_ref().map(|a| a.sample_rate()).unwrap_or(44_100.0);
 
-        // --- fill uniforms (scene renders at super-sampled resolution) ------
-        let (w, h) = self.gpu.size;
-        let (sw, sh) = self.postfx.scene_size();
-        let mx = sw as f32 / w.max(1) as f32;
-        let my = sh as f32 / h.max(1) as f32;
-        {
-            let u = &mut self.uniforms;
-            u.resolution = [sw as f32, sh as f32, 1.0, sw as f32 / sh.max(1) as f32];
-            u.mouse = [self.mouse[0] * mx, self.mouse[1] * my, self.mouse[2] * mx, self.mouse[3] * my];
-            u.time = [t, dt, self.frame as f32, sample_rate];
-            u.audio = [audio_frame.bass, audio_frame.mid, audio_frame.treble, audio_frame.volume];
-            u.sys = [cpu, mem, audio_frame.bass, self.fps];
-            u.set_spectrum(&audio_frame.spectrum);
-        }
-        self.renderer.update_uniforms(&self.gpu, &self.uniforms);
+        // --- draw every monitor ---------------------------------------------
+        let mut actions = Vec::new();
+        for i in 0..self.monitors.len() {
+            let (sw, sh) = self.monitors[i].postfx.scene_size();
+            let (w, h) = self.monitors[i].gpu.size;
+            let mx = sw as f32 / w.max(1) as f32;
+            let my = sh as f32 / h.max(1) as f32;
+            {
+                let u = &mut self.uniforms;
+                u.resolution = [sw as f32, sh as f32, 1.0, sw as f32 / sh.max(1) as f32];
+                u.mouse =
+                    [self.mouse[0] * mx, self.mouse[1] * my, self.mouse[2] * mx, self.mouse[3] * my];
+                u.time = [t, dt, self.frame as f32, sample_rate];
+                u.audio =
+                    [audio_frame.bass, audio_frame.mid, audio_frame.treble, audio_frame.volume];
+                u.sys = [cpu, mem, audio_frame.bass, self.fps];
+                u.set_spectrum(&audio_frame.spectrum);
+            }
 
-        // --- acquire + draw -------------------------------------------------
-        let Some(frame) = self.gpu.acquire() else {
+            if i == 0 && self.ui.is_some() {
+                let meters = Meters {
+                    fps: self.fps,
+                    resolution: [w, h],
+                    audio_active,
+                    bass: audio_frame.bass,
+                    mid: audio_frame.mid,
+                    treble: audio_frame.treble,
+                    volume: audio_frame.volume,
+                    cpu,
+                    mem,
+                    wallpaper_running: self.wallpaper_active(),
+                };
+                actions = self.render_primary(meters);
+            } else {
+                let renderer = &self.renderer;
+                let uniforms = &self.uniforms;
+                self.monitors[i].render(renderer, uniforms);
+            }
+        }
+        actions
+    }
+
+    /// Render monitor 0 with the egui settings panel composited on top.
+    fn render_primary(&mut self, meters: Meters) -> Vec<UiAction> {
+        // Split-borrow distinct fields so the GUI, renderer and target coexist.
+        let renderer = &self.renderer;
+        let uniforms = &self.uniforms;
+        let settings = &mut self.settings;
+        let scene_names = &self.scene_names;
+        let Some(ui) = self.ui.as_mut() else {
+            return Vec::new();
+        };
+        let target = &mut self.monitors[0];
+
+        renderer.update_uniforms(&target.gpu, uniforms);
+        let Some(frame) = target.gpu.acquire() else {
             return Vec::new();
         };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
+        let mut encoder = target
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rlw-encoder") });
 
-        // Scene → HDR super-sampled target, then bloom/tonemap → swapchain.
-        self.renderer.draw_scene(&self.gpu, self.postfx.scene_view(), &mut encoder);
-        self.postfx.render(&mut encoder, &view);
+        renderer.draw_scene(&target.gpu, target.postfx.scene_view(), &mut encoder);
+        target.postfx.render(&mut encoder, &view);
 
-        let mut actions = Vec::new();
-        let mut user_bufs = Vec::new();
-        if let Some(ui) = self.ui.as_mut() {
-            let meters = Meters {
-                fps: self.fps,
-                resolution: [w, h],
-                audio_active,
-                bass: audio_frame.bass,
-                mid: audio_frame.mid,
-                treble: audio_frame.treble,
-                volume: audio_frame.volume,
-                cpu,
-                mem,
-                wallpaper_running: self.wallpaper_child.is_some(),
-            };
-            let (a, b) = ui.draw(
-                &self.gpu,
-                self.window.as_ref(),
-                &view,
-                &mut encoder,
-                &mut self.settings,
-                &self.scene_names,
-                &meters,
-            );
-            actions = a;
-            user_bufs = b;
-        }
+        let (actions, user_bufs) = ui.draw(
+            &target.gpu,
+            target.window.as_ref(),
+            &view,
+            &mut encoder,
+            settings,
+            scene_names,
+            &meters,
+        );
 
-        self.gpu
+        target
+            .gpu
             .queue
             .submit(user_bufs.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
@@ -431,12 +608,12 @@ impl State {
         match action {
             UiAction::SelectScene(i) => {
                 if let Some(scene) = self.scenes.get(i) {
-                    self.shader_path = load_scene(&self.gpu, &mut self.renderer, scene);
+                    self.shader_path = load_scene(&self.monitors[0].gpu, &mut self.renderer, scene);
                 }
             }
             UiAction::Reload => {
                 if let Some(scene) = self.scenes.get(self.settings.scene) {
-                    self.shader_path = load_scene(&self.gpu, &mut self.renderer, scene);
+                    self.shader_path = load_scene(&self.monitors[0].gpu, &mut self.renderer, scene);
                 }
             }
             UiAction::SetAudio(a) => {
@@ -449,10 +626,13 @@ impl State {
     }
 
     fn toggle_wallpaper(&mut self) {
-        if let Some(mut child) = self.wallpaper_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-            log::info!("wallpaper stopped");
+        // Stop whatever is running — our own child and/or any other instance.
+        if self.wallpaper_active() {
+            if platform::signal_stop() {
+                log::info!("wallpaper stop requested");
+            }
+            // Detach our child handle; it exits on its own from the stop signal.
+            let _ = self.wallpaper_child.take();
             return;
         }
         match self.spawn_wallpaper() {

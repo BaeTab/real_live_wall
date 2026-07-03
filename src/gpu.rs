@@ -1,25 +1,38 @@
 //! wgpu instance / adapter / device / surface bootstrap.
+//!
+//! [`GpuContext`] owns the process-wide instance/adapter/device/queue. Each
+//! window then gets its own [`Gpu`] (surface + swapchain config) that shares
+//! that one device/queue — this is what lets a single wallpaper process drive
+//! one surface per monitor without spinning up a GPU device per screen.
 
 use std::sync::Arc;
 
 use anyhow::Context;
 use winit::window::Window;
 
+/// Process-wide GPU state shared by every surface.
+pub struct GpuContext {
+    // Kept alive for the lifetime of every surface created from it.
+    _instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+/// A single window's surface + swapchain, backed by a shared [`GpuContext`].
 pub struct Gpu {
     pub surface: wgpu::Surface<'static>,
-    #[allow(dead_code)]
-    pub adapter: wgpu::Adapter,
+    // Cheap handle clones of the shared context (Arc under the hood).
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: (u32, u32),
 }
 
-impl Gpu {
-    pub fn new(window: Arc<Window>) -> anyhow::Result<Self> {
-        let inner = window.inner_size();
-        let (width, height) = (inner.width.max(1), inner.height.max(1));
-
+impl GpuContext {
+    /// Bootstrap the shared GPU state around a first window, returning both the
+    /// context and that window's [`Gpu`].
+    pub fn new(window: Arc<Window>) -> anyhow::Result<(Self, Gpu)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             flags: wgpu::InstanceFlags::default(),
@@ -54,31 +67,58 @@ impl Gpu {
         // even if a user GLSL shader fails validation).
         device.on_uncaptured_error(std::sync::Arc::new(|err| log::error!("wgpu error: {err}")));
 
+        let ctx = Self {
+            _instance: instance,
+            adapter,
+            device,
+            queue,
+        };
+        let gpu = ctx.configure_surface(surface, window.inner_size())?;
+        Ok((ctx, gpu))
+    }
+
+    /// Create an additional [`Gpu`] for another window, reusing this device.
+    pub fn create_gpu(&self, window: Arc<Window>) -> anyhow::Result<Gpu> {
+        let surface = self
+            ._instance
+            .create_surface(window.clone())
+            .context("failed to create wgpu surface")?;
+        self.configure_surface(surface, window.inner_size())
+    }
+
+    fn configure_surface(
+        &self,
+        surface: wgpu::Surface<'static>,
+        inner: winit::dpi::PhysicalSize<u32>,
+    ) -> anyhow::Result<Gpu> {
+        let (width, height) = (inner.width.max(1), inner.height.max(1));
+
         // A fully-populated config for this surface/adapter (fills new fields such
         // as color space automatically), then tweak the bits we care about.
         let mut config = surface
-            .get_default_config(&adapter, width, height)
+            .get_default_config(&self.adapter, width, height)
             .context("surface is not supported by this adapter")?;
         config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
         config.present_mode = wgpu::PresentMode::AutoVsync;
         // Prefer a non-sRGB format so shader output matches Shadertoy 1:1
         // (Shadertoy writes un-gamma-corrected values to an sRGB canvas).
-        let caps = surface.get_capabilities(&adapter);
+        let caps = surface.get_capabilities(&self.adapter);
         if let Some(f) = caps.formats.iter().copied().find(|f| !f.is_srgb()) {
             config.format = f;
         }
-        surface.configure(&device, &config);
+        surface.configure(&self.device, &config);
 
-        Ok(Self {
+        Ok(Gpu {
             surface,
-            adapter,
-            device,
-            queue,
+            device: self.device.clone(),
+            queue: self.queue.clone(),
             config,
             size: (width, height),
         })
     }
+}
 
+impl Gpu {
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;

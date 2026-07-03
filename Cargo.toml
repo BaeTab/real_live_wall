@@ -1,6 +1,6 @@
 [package]
 name = "real_live_wall"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["BaeTab <bhwoo48@gmail.com>"]
@@ -30,9 +30,15 @@ egui-wgpu = "0.35"
 egui-winit = "0.35"
 rfd = "0.17"
 
+[target.'cfg(windows)'.build-dependencies]
+# Embeds assets/icon.ico into the exe (Explorer + taskbar + window icon).
+winresource = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
 ] }

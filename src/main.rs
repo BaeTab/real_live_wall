@@ -23,17 +23,41 @@ mod uniforms;
 use clap::Parser;
 use winit::event_loop::{ControlFlow, EventLoop};
 
+use crate::app::AppEvent;
+use crate::config::Mode;
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let config = config::Config::parse();
-    log::info!("real_live_wall starting ({:?} mode)", config.mode);
 
-    let event_loop = EventLoop::new()?;
+    // `--stop`: just signal any running wallpaper and quit — no window needed.
+    if config.stop {
+        if platform::signal_stop() {
+            log::info!("stop signal sent to running wallpaper");
+        } else {
+            log::info!("no running wallpaper found");
+        }
+        return Ok(());
+    }
+
+    log::info!("real_live_wall starting ({:?} mode)", config.mode);
+    let mode = config.mode;
+
+    // A user-event loop so a background thread can wake us to exit cleanly when
+    // another instance requests a wallpaper stop.
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     // Continuous animation: keep pumping frames.
     event_loop.set_control_flow(ControlFlow::Poll);
+    let proxy = event_loop.create_proxy();
 
-    let mut app = app::App::new(config);
+    let mut app = app::App::new(config, proxy);
     event_loop.run_app(&mut app)?;
+
+    // After the wallpaper's windows are gone, nudge the shell to repaint the
+    // static desktop wallpaper so no black region is left behind.
+    if mode == Mode::Wallpaper {
+        platform::restore_desktop();
+    }
     Ok(())
 }

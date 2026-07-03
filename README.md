@@ -19,6 +19,7 @@
 | 시스템 반응(CPU/메모리) | ❌ | ❌ | ✅ |
 | Shadertoy 셰이더 호환 | ❌ | ❌ | ✅ `mainImage()` 그대로 |
 | HDR 블룸·톤매핑·AA | ✅ | ❌ | ✅ 시네마틱 포스트FX |
+| 멀티모니터 | ✅ | ✅ | ✅ 모니터마다 전체 장면 개별 렌더 |
 | 설정 GUI | ✅ | 일부 | ✅ egui 패널(F1) |
 | 오픈소스 | ❌ | ✅ | ✅ |
 
@@ -29,11 +30,16 @@
 
 ![real_live_wall 설정 GUI](docs/screenshots/gui.png)
 
+**시네마틱 자연 씬** — `sunset_clouds`(도메인워프 fbm 구름 + 태양 블룸). 씬을 고르고
+**"바탕화면에 적용"**을 누르면 연결된 **모든 모니터에** 각각 전체 장면으로 깔립니다.
+
+![sunset_clouds 씬 + 설정 패널](docs/screenshots/scene_sunset.png)
+
 **Shadertoy GLSL** — `shaders/plasma.glsl`을 수정 없이 로드 (naga GLSL 프론트엔드)
 
 ![Shadertoy plasma 셰이더](docs/screenshots/shadertoy_plasma.png)
 
-> 실측 환경: Windows 11 · NVIDIA RTX 3060 · Vulkan 백엔드.
+> 실측 환경: Windows 11 · NVIDIA RTX 3060 · Vulkan 백엔드 · 4모니터 동시 부착.
 
 ## 🚀 빠른 시작
 
@@ -41,7 +47,12 @@
 
 가장 쉬운 길: [릴리즈](https://github.com/BaeTab/real_live_wall/releases)에서 zip을 받아
 `real_live_wall.exe`를 **더블클릭** → 설정 GUI 창이 뜹니다. 씬·오디오를 고르고
-**"바탕화면에 적용"**을 누르면 데스크톱 배경으로 실행됩니다. (`F1` = 패널 토글)
+**"바탕화면에 적용"**을 누르면 **연결된 모든 모니터**에 데스크톱 배경으로 실행됩니다.
+(`F1` = 패널 토글)
+
+**끄기:** 설정 패널의 **"■ 월페이퍼 중지"** 버튼을 누르거나, 어디서든
+`real_live_wall.exe --stop` 을 실행하면 실행 중인 월페이퍼가 종료되고 원래
+바탕화면이 복구됩니다. (프리뷰 창을 닫아도 다시 열어 끌 수 있습니다.)
 
 소스로 실행:
 
@@ -52,8 +63,11 @@ cargo run --release
 # Shadertoy 스타일 GLSL 씬 로드 + 파일 변경 시 핫리로드
 cargo run --release -- --shader shaders/audio_bars.glsl --watch
 
-# 처음부터 데스크톱 월페이퍼로 (GUI 없이)
+# 처음부터 데스크톱 월페이퍼로 (모든 모니터, GUI 없이)
 cargo run --release -- --mode wallpaper --shader shaders/plasma.glsl
+
+# 실행 중인 월페이퍼 끄기 (어느 창에서든)
+cargo run --release -- --stop
 ```
 
 단축키: `F1` 설정 패널 토글 · `Esc` 종료(preview 모드).
@@ -62,7 +76,8 @@ cargo run --release -- --mode wallpaper --shader shaders/plasma.glsl
 
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
-| `--mode <preview\|wallpaper>` | `preview` | 미리보기 창 / 실제 바탕화면 |
+| `--mode <preview\|wallpaper>` | `preview` | 미리보기 창 / 실제 바탕화면(모든 모니터) |
+| `--stop` | — | 실행 중인 월페이퍼를 종료하고 바탕화면 복구 |
 | `--shader <path>`, `-s` | (기본 WGSL 씬) | Shadertoy GLSL 파일 |
 | `--audio <auto\|input\|loopback\|off>` | `auto` | 오디오 소스 (Windows는 auto=루프백) |
 | `--gain <f32>` | `6.0` | 오디오 감도 |
@@ -102,10 +117,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 | 씬 | 설명 |
 |---|---|
 | 기본 (오로라) | 오로라 + 별 + 64밴드 스펙트럼 이퀄라이저 (WGSL) |
-| `ocean` | 황혼의 바다 + 태양 반짝임 (bass 반응) |
-| `sunset_clouds` | 노을 하늘에 흐르는 fbm 구름 |
-| `mountains` | 해질녘 다층 산 실루엣 + 별 |
-| `rain` | 빗줄기 + bass에 번쩍이는 번개 |
+| `ocean` | 황혼의 바다 + 태양 글리터 반짝임 (bass·treble 반응) |
+| `sunset_clouds` | 노을 하늘 + 도메인워프 fbm 구름 + 태양 후광 (treble 반응) |
+| `mountains` | 해질녘 다층 산 실루엣 (안개 원근·안티에일리어싱) + 반짝이는 별 |
+| `rain` | 다층 빗줄기 + bass에 번쩍이는 번개 섬광 |
 | `forest_fireflies` | 안개 낀 숲의 반딧불 (volume 반응) |
 | `plasma` | 클래식 Shadertoy 플라즈마 |
 | `audio_bars` | 오디오 스펙트럼 바 |
@@ -117,8 +132,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 ## 🗺️ 로드맵
 
+- [x] 멀티모니터 — 모니터마다 전체 장면 개별 렌더
+- [x] 실행 중 월페이퍼 원격 종료(`--stop` / 패널 버튼) + 바탕화면 복구
 - [ ] macOS/Linux 월페이퍼 표면 구현
-- [ ] 멀티모니터 개별 씬
+- [ ] 모니터별 씬 개별 선택
+- [ ] 로그인 시 자동 시작
 - [ ] Shadertoy `iChannel0` 오디오 텍스처 완전 호환
 - [ ] 멀티패스(버퍼) 셰이더
 - [ ] 날씨/캘린더 리액티브 소스
