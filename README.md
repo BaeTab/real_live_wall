@@ -7,7 +7,7 @@
 `real_live_wall`은 다르다. **바탕화면이 지금 내 컴퓨터의 상태 — 재생 중인 음악의
 스펙트럼, CPU/메모리 부하, 시간 — 에 실시간으로 반응**하고, **Shadertoy의 GLSL
 셰이더를 거의 그대로** 돌린다. 그리고 Windows/macOS/Linux를 **하나의 셰이더 포맷**으로
-겨냥한다.
+겨냥한다. 모든 씬은 **HDR 블룸 · ACES 톤매핑 · 슈퍼샘플 AA**를 거쳐 시네마틱하게 출력된다.
 
 ## ✨ 차별점
 
@@ -18,6 +18,7 @@
 | 오디오 반응(FFT) | 제한적 | ❌ | ✅ 64-bin 스펙트럼 + bass/mid/treble |
 | 시스템 반응(CPU/메모리) | ❌ | ❌ | ✅ |
 | Shadertoy 셰이더 호환 | ❌ | ❌ | ✅ `mainImage()` 그대로 |
+| HDR 블룸·톤매핑·AA | ✅ | ❌ | ✅ 시네마틱 포스트FX |
 | 설정 GUI | ✅ | 일부 | ✅ egui 패널(F1) |
 | 오픈소스 | ❌ | ✅ | ✅ |
 
@@ -65,6 +66,7 @@ cargo run --release -- --mode wallpaper --shader shaders/plasma.glsl
 | `--shader <path>`, `-s` | (기본 WGSL 씬) | Shadertoy GLSL 파일 |
 | `--audio <auto\|input\|loopback\|off>` | `auto` | 오디오 소스 (Windows는 auto=루프백) |
 | `--gain <f32>` | `6.0` | 오디오 감도 |
+| `--ssaa <f32>` | `1.5` | 슈퍼샘플 AA 배율 (1.0=끔, 2.0=최상, 부하↑) |
 | `--watch` | `false` | 셰이더 파일 핫리로드 |
 | `--width`/`--height` | `1280`/`720` | preview 창 크기 |
 

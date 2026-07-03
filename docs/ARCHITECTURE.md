@@ -44,7 +44,8 @@
 | `config.rs` | clap 기반 실행 옵션 (`--mode`, `--shader`, `--audio`, `--gain`, `--watch`) |
 | `app.rs` | `ApplicationHandler`: 창 생명주기, 프레임 루프, 입력, 핫리로드 |
 | `gpu.rs` | wgpu 인스턴스/어댑터/디바이스/서피스 부트스트랩, 리사이즈 |
-| `renderer.rs` | uniform 버퍼·바인드그룹·파이프라인 소유, 셰이더 핫스왑, 렌더 패스 |
+| `renderer.rs` | uniform 버퍼·바인드그룹·파이프라인 소유, 셰이더 핫스왑, HDR 씬 패스 |
+| `postfx.rs` | HDR 오프스크린 → bright-pass → 가우시안 블룸(핑퐁) → ACES 톤매핑+비네트 합성 |
 | `shader.rs` | 풀스크린 WGSL 버텍스, 기본 WGSL 씬, **Shadertoy→GLSL 래퍼** |
 | `uniforms.rs` | Rust/WGSL/GLSL 공유 uniform 레이아웃 (`#[repr(C)]` + `Pod`) |
 | `audio.rs` | cpal 캡처(루프백 우선) + rustfft 스펙트럼 분석, graceful fallback |
@@ -75,14 +76,18 @@ Shadertoy 셰이더는 `shader.rs`의 래퍼가 위 블록을 `#define iResoluti
 - **버텍스**: 항상 WGSL 풀스크린 삼각형(3정점, 버퍼 없음).
 - **프래그먼트**: 기본 WGSL 씬 또는 래핑된 GLSL. 둘 다 같은 파이프라인 레이아웃
   (group 0, binding 0 = uniform, FRAGMENT 가시성)을 쓴다.
-- 서피스 포맷은 **비-sRGB(UNORM) 우선** — Shadertoy가 감마 보정 없이 sRGB 캔버스에
-  쓰는 동작을 1:1로 재현하기 위함.
-- GLSL 컴파일은 `push_error_scope`로 감싸 실패 시 이전 파이프라인 유지(핫리로드 안전).
+- **HDR 후처리 파이프라인**: 씬은 스왑체인이 아니라 `Rgba16Float` 오프스크린 타깃에
+  **슈퍼샘플(SSAA) 해상도**로 렌더 → `postfx`가 bright-pass → 2회 핑퐁 가우시안 블룸
+  → ACES 톤매핑 + 채도 + 비네트로 스왑체인에 합성. SSAA가 앨리어싱을 없애고, 블룸이
+  라이트·글로우를 살려 "프리미엄" 룩을 만든다.
+- egui 패널은 합성 결과 위에 `LoadOp::Load`로 그린다.
 
 ## 플랫폼별 월페이퍼 표면
 
-- **Windows**: `Progman`에 `0x052C` 메시지 → `WorkerW` 생성 → `EnumWindows`로 찾아
-  `SetParent(우리 창, WorkerW)`. 데스크톱 아이콘 뒤 레이어에 그린다.
+- **Windows**: `Progman`에 `0x052C` 메시지 → `WorkerW` 생성 → `EnumWindows`(+Win11
+  폴백)로 찾아 `SetParent(우리 창, WorkerW)`. 이후 `SetWindowPos`로 **주 모니터에 정확히
+  꽉 차게**(가상 데스크톱 좌표 보정) + `HWND_BOTTOM`으로 아이콘 뒤에 배치. (멀티모니터
+  개별 씬은 예정)
 - **macOS**(예정): 각 스크린마다 `kCGDesktopWindowLevel` NSWindow.
 - **Linux**(예정): X11 루트/데스크톱 타입, Wayland는 `wlr-layer-shell`.
 

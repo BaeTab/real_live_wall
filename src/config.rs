@@ -64,6 +64,10 @@ pub struct Config {
     #[arg(long, default_value_t = 6.0)]
     pub gain: f32,
 
+    /// Super-sampling factor for anti-aliasing (1.0 = off, 1.5–2.0 = crisper).
+    #[arg(long, default_value_t = 1.5)]
+    pub ssaa: f32,
+
     /// Hot-reload the GLSL shader file when it changes on disk.
     #[arg(long, default_value_t = false)]
     pub watch: bool,

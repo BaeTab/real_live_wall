@@ -62,9 +62,11 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(shader::FULLSCREEN_VS.into()),
         });
 
+        // The scene renders into the post-processing HDR target, not the
+        // swapchain, so the pipeline must target that format.
+        let format = crate::postfx::HDR_FORMAT;
         let fs_module = wgsl_module(device, shader::DEFAULT_WGSL_FS);
-        let pipeline =
-            build_pipeline(device, &pipeline_layout, &vs_module, &fs_module, gpu.config.format);
+        let pipeline = build_pipeline(device, &pipeline_layout, &vs_module, &fs_module, format);
 
         Ok(Self {
             uniform_buf,
@@ -73,7 +75,7 @@ impl Renderer {
             pipeline_layout,
             vs_module,
             pipeline,
-            format: gpu.config.format,
+            format,
         })
     }
 

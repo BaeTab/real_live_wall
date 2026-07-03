@@ -13,6 +13,7 @@ mod audio;
 mod config;
 mod gpu;
 mod platform;
+mod postfx;
 mod reactive;
 mod renderer;
 mod shader;

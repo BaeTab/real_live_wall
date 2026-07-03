@@ -19,6 +19,7 @@ use winit::window::{Window, WindowId};
 use crate::audio::AudioEngine;
 use crate::config::{Config, Mode};
 use crate::gpu::Gpu;
+use crate::postfx::PostFx;
 use crate::reactive::Reactive;
 use crate::renderer::Renderer;
 use crate::ui::{Meters, Settings, Ui, UiAction};
@@ -72,6 +73,7 @@ struct State {
     window: Arc<Window>,
     gpu: Gpu,
     renderer: Renderer,
+    postfx: PostFx,
     audio: Option<AudioEngine>,
     reactive: Reactive,
     uniforms: Uniforms,
@@ -138,6 +140,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::Resized(size) => {
                 state.gpu.resize(size.width, size.height);
+                state.postfx.resize(&state.gpu, size.width, size.height);
                 state.renderer.rebind(&state.gpu);
             }
 
@@ -198,9 +201,10 @@ fn build_state(config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Result<
     }
     let window = Arc::new(event_loop.create_window(attrs)?);
 
-    // --- gpu + renderer -----------------------------------------------------
+    // --- gpu + renderer + post-processing -----------------------------------
     let gpu = Gpu::new(window.clone())?;
     let mut renderer = Renderer::new(&gpu)?;
+    let postfx = PostFx::new(&gpu, config.ssaa.clamp(1.0, 2.0));
 
     // --- scenes + initial selection -----------------------------------------
     let mut scenes = discover_scenes();
@@ -262,6 +266,7 @@ fn build_state(config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Result<
         window,
         gpu,
         renderer,
+        postfx,
         audio,
         reactive: Reactive::new(),
         uniforms: Uniforms::default(),
@@ -355,12 +360,15 @@ impl State {
         let (cpu, mem) = self.reactive.poll();
         let sample_rate = self.audio.as_ref().map(|a| a.sample_rate()).unwrap_or(44_100.0);
 
-        // --- fill uniforms --------------------------------------------------
+        // --- fill uniforms (scene renders at super-sampled resolution) ------
         let (w, h) = self.gpu.size;
+        let (sw, sh) = self.postfx.scene_size();
+        let mx = sw as f32 / w.max(1) as f32;
+        let my = sh as f32 / h.max(1) as f32;
         {
             let u = &mut self.uniforms;
-            u.resolution = [w as f32, h as f32, 1.0, w as f32 / h.max(1) as f32];
-            u.mouse = self.mouse;
+            u.resolution = [sw as f32, sh as f32, 1.0, sw as f32 / sh.max(1) as f32];
+            u.mouse = [self.mouse[0] * mx, self.mouse[1] * my, self.mouse[2] * mx, self.mouse[3] * my];
             u.time = [t, dt, self.frame as f32, sample_rate];
             u.audio = [audio_frame.bass, audio_frame.mid, audio_frame.treble, audio_frame.volume];
             u.sys = [cpu, mem, audio_frame.bass, self.fps];
@@ -380,7 +388,9 @@ impl State {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rlw-encoder") });
 
-        self.renderer.draw_scene(&self.gpu, &view, &mut encoder);
+        // Scene → HDR super-sampled target, then bloom/tonemap → swapchain.
+        self.renderer.draw_scene(&self.gpu, self.postfx.scene_view(), &mut encoder);
+        self.postfx.render(&mut encoder, &view);
 
         let mut actions = Vec::new();
         let mut user_bufs = Vec::new();

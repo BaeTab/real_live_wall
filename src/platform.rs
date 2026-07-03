@@ -35,7 +35,9 @@ mod win {
     use windows::core::{w, BOOL, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, FindWindowExW, FindWindowW, SendMessageTimeoutW, SetParent, SMTO_NORMAL,
+        EnumWindows, FindWindowExW, FindWindowW, GetSystemMetrics, SendMessageTimeoutW, SetParent,
+        SetWindowPos, HWND_BOTTOM, SMTO_NORMAL, SM_CXSCREEN, SM_CYSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     };
 
     /// Message that asks Progman to spawn a `WorkerW` behind the icons.
@@ -83,15 +85,39 @@ mod win {
                 Some(&mut result as *mut usize),
             );
 
-            // Find the freshly spawned WorkerW.
+            // Find the WorkerW behind the desktop icons.
             let mut data = FindData {
                 worker: HWND(std::ptr::null_mut()),
             };
             let _ = EnumWindows(Some(enum_proc), LPARAM(&mut data as *mut _ as isize));
+            // Win11 fallback: WorkerW can be a direct child of Progman.
+            if data.worker.0.is_null() {
+                if let Ok(w) = FindWindowExW(Some(progman), None, w!("WorkerW"), PCWSTR::null()) {
+                    data.worker = w;
+                }
+            }
 
             let parent = if data.worker.0.is_null() { progman } else { data.worker };
             SetParent(child, Some(parent)).map_err(|e| anyhow!("SetParent failed: {e}"))?;
-            log::info!("wallpaper: attached window to desktop layer");
+
+            // Cover exactly the primary monitor. WorkerW's client origin is the
+            // virtual-desktop top-left, so the primary monitor sits at
+            // (-SM_XVIRTUALSCREEN, -SM_YVIRTUALSCREEN) in that space. Drop to the
+            // bottom of the z-order so the desktop icons stay on top.
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let pw = GetSystemMetrics(SM_CXSCREEN);
+            let ph = GetSystemMetrics(SM_CYSCREEN);
+            let _ = SetWindowPos(
+                child,
+                Some(HWND_BOTTOM),
+                -vx,
+                -vy,
+                pw,
+                ph,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
+            log::info!("wallpaper: attached to primary monitor ({pw}x{ph} at {},{})", -vx, -vy);
         }
         Ok(())
     }
