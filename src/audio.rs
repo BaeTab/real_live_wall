@@ -131,6 +131,9 @@ impl AudioEngine {
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
     }
+    pub fn set_gain(&mut self, gain: f32) {
+        self.gain = gain;
+    }
 
     /// Run one FFT over the latest samples and return smoothed analysis.
     pub fn analyze(&mut self) -> AudioFrame {

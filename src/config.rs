@@ -22,6 +22,27 @@ pub enum AudioArg {
     Off,
 }
 
+impl AudioArg {
+    pub fn to_source(self) -> Option<AudioSource> {
+        match self {
+            AudioArg::Off => None,
+            AudioArg::Auto => Some(AudioSource::Auto),
+            AudioArg::Input => Some(AudioSource::Input),
+            AudioArg::Loopback => Some(AudioSource::Loopback),
+        }
+    }
+
+    /// The clap value name, for spawning a wallpaper child process.
+    pub fn as_cli(self) -> &'static str {
+        match self {
+            AudioArg::Auto => "auto",
+            AudioArg::Input => "input",
+            AudioArg::Loopback => "loopback",
+            AudioArg::Off => "off",
+        }
+    }
+}
+
 /// Reactive, cross-platform live wallpaper engine.
 #[derive(Parser, Debug)]
 #[command(name = "real_live_wall", version, about)]
@@ -62,11 +83,6 @@ pub struct Config {
 
 impl Config {
     pub fn audio_source(&self) -> Option<AudioSource> {
-        match self.audio {
-            AudioArg::Off => None,
-            AudioArg::Auto => Some(AudioSource::Auto),
-            AudioArg::Input => Some(AudioSource::Input),
-            AudioArg::Loopback => Some(AudioSource::Loopback),
-        }
+        self.audio.to_source()
     }
 }

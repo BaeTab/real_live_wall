@@ -3,6 +3,11 @@
 크로스플랫폼 **리액티브 라이브 월페이퍼 엔진**. GPU 네이티브(wgpu), Shadertoy GLSL
 호환, 실시간 오디오/시스템 반응을 목표로 한다.
 
+> **스택 주의:** 렌더링은 **wgpu 29**를 쓴다(최신 egui-wgpu 0.35가 `wgpu ^29`를
+> 요구하기 때문). GUI(egui)와 엔진이 하나의 wgpu 인스턴스를 공유하며, 설정 패널은
+> 셰이더와 같은 프레임 위에 `LoadOp::Load`로 합성된다. release 빌드는
+> `windows_subsystem = "windows"`로 콘솔 없는 GUI 앱이다.
+
 ## 설계 원칙
 
 1. **GPU 네이티브 / 저부하** — 모든 씬은 풀스크린 프래그먼트 셰이더 1패스로 그린다.
@@ -44,6 +49,7 @@
 | `uniforms.rs` | Rust/WGSL/GLSL 공유 uniform 레이아웃 (`#[repr(C)]` + `Pod`) |
 | `audio.rs` | cpal 캡처(루프백 우선) + rustfft 스펙트럼 분석, graceful fallback |
 | `reactive.rs` | sysinfo CPU/메모리 샘플링 |
+| `ui.rs` | egui 설정 패널(씬/오디오/게인/미터/월페이퍼 적용), 셰이더 위에 합성 |
 | `platform.rs` | 월페이퍼 표면 획득 — Windows `WorkerW` 부착, mac/linux 스텁 |
 
 ## uniform 계약

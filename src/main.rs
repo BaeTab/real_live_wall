@@ -2,7 +2,11 @@
 //!
 //! Draws a full-screen shader (built-in WGSL scene or a Shadertoy GLSL file)
 //! that reacts in real time to system audio, CPU/memory load and the clock,
-//! either in a preview window or as the live desktop wallpaper.
+//! either in a preview window (with an egui settings panel) or as the live
+//! desktop wallpaper.
+
+// Release builds are a GUI app: no console window pops up on double-click.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod audio;
@@ -12,6 +16,7 @@ mod platform;
 mod reactive;
 mod renderer;
 mod shader;
+mod ui;
 mod uniforms;
 
 use clap::Parser;

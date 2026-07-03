@@ -18,13 +18,15 @@
 | 오디오 반응(FFT) | 제한적 | ❌ | ✅ 64-bin 스펙트럼 + bass/mid/treble |
 | 시스템 반응(CPU/메모리) | ❌ | ❌ | ✅ |
 | Shadertoy 셰이더 호환 | ❌ | ❌ | ✅ `mainImage()` 그대로 |
+| 설정 GUI | ✅ | 일부 | ✅ egui 패널(F1) |
 | 오픈소스 | ❌ | ✅ | ✅ |
 
 ## 🖼️ 스크린샷
 
-**기본 씬** — 오디오 반응형 오로라 + 64밴드 스펙트럼 이퀄라이저 (WGSL, preview 모드)
+**설정 GUI (egui)** — 씬/셰이더 선택, 오디오 소스·게인, 실시간 미터(FPS·CPU·오디오),
+그리고 **"바탕화면에 적용"** 버튼. `F1`로 패널을 숨기면 순수 배경만 남습니다.
 
-![real_live_wall 기본 씬](docs/screenshots/preview.png)
+![real_live_wall 설정 GUI](docs/screenshots/gui.png)
 
 **Shadertoy GLSL** — `shaders/plasma.glsl`을 수정 없이 로드 (naga GLSL 프론트엔드)
 
@@ -36,18 +38,24 @@
 
 필요: [Rust](https://rustup.rs) (stable), 그리고 Vulkan/DX12/Metal 지원 GPU.
 
+가장 쉬운 길: [릴리즈](https://github.com/BaeTab/real_live_wall/releases)에서 zip을 받아
+`real_live_wall.exe`를 **더블클릭** → 설정 GUI 창이 뜹니다. 씬·오디오를 고르고
+**"바탕화면에 적용"**을 누르면 데스크톱 배경으로 실행됩니다. (`F1` = 패널 토글)
+
+소스로 실행:
+
 ```bash
-# 개발용 미리보기 창 (기본 오로라 씬)
+# 설정 GUI가 있는 미리보기 창 (기본 오로라 씬)
 cargo run --release
 
 # Shadertoy 스타일 GLSL 씬 로드 + 파일 변경 시 핫리로드
 cargo run --release -- --shader shaders/audio_bars.glsl --watch
 
-# 실제 데스크톱 월페이퍼로 (Windows)
+# 처음부터 데스크톱 월페이퍼로 (GUI 없이)
 cargo run --release -- --mode wallpaper --shader shaders/plasma.glsl
 ```
 
-`Esc`(preview 모드) 로 종료.
+단축키: `F1` 설정 패널 토글 · `Esc` 종료(preview 모드).
 
 ## ⚙️ CLI 옵션
 
@@ -84,6 +92,21 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 예제: [`shaders/plasma.glsl`](shaders/plasma.glsl)(순수 Shadertoy),
 [`shaders/audio_bars.glsl`](shaders/audio_bars.glsl)(오디오 반응).
+
+### 🌊 기본 제공 씬
+
+`shaders/` 폴더의 `.glsl`은 설정 GUI 드롭다운에 자동으로 나타납니다.
+
+| 씬 | 설명 |
+|---|---|
+| 기본 (오로라) | 오로라 + 별 + 64밴드 스펙트럼 이퀄라이저 (WGSL) |
+| `ocean` | 황혼의 바다 + 태양 반짝임 (bass 반응) |
+| `sunset_clouds` | 노을 하늘에 흐르는 fbm 구름 |
+| `mountains` | 해질녘 다층 산 실루엣 + 별 |
+| `rain` | 빗줄기 + bass에 번쩍이는 번개 |
+| `forest_fireflies` | 안개 낀 숲의 반딧불 (volume 반응) |
+| `plasma` | 클래식 Shadertoy 플라즈마 |
+| `audio_bars` | 오디오 스펙트럼 바 |
 
 ## 🧭 아키텍처
 

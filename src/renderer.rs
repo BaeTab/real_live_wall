@@ -6,13 +6,6 @@ use crate::gpu::Gpu;
 use crate::shader;
 use crate::uniforms::Uniforms;
 
-/// What happened when we tried to draw a frame.
-pub enum RenderOutcome {
-    Presented,
-    NeedsReconfigure,
-    Skipped,
-}
-
 pub struct Renderer {
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -126,51 +119,34 @@ impl Renderer {
     /// Hook for future bind-group invalidation on resize (currently a no-op).
     pub fn rebind(&mut self, _gpu: &Gpu) {}
 
-    pub fn render(&self, gpu: &Gpu) -> RenderOutcome {
-        let frame = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Lost
-            | wgpu::CurrentSurfaceTexture::Validation => return RenderOutcome::NeedsReconfigure,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return RenderOutcome::Skipped
-            }
-        };
-
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("rlw-encoder"),
+    /// Record the full-screen shader pass (clears the target) into `encoder`.
+    /// The caller owns frame acquisition, submission and presentation so that
+    /// the GUI can composite on top of the same frame.
+    pub fn draw_scene(
+        &self,
+        _gpu: &Gpu,
+        view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("rlw-scene-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("rlw-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, Some(&self.bind_group), &[]);
-            pass.draw(0..3, 0..1);
-        }
-
-        gpu.queue.submit(std::iter::once(encoder.finish()));
-        // wgpu 30: presentation moved from `SurfaceTexture::present` to the queue.
-        gpu.queue.present(frame);
-        RenderOutcome::Presented
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, Some(&self.bind_group), &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 

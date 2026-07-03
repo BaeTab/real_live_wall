@@ -1,6 +1,6 @@
 [package]
 name = "real_live_wall"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["BaeTab <bhwoo48@gmail.com>"]
@@ -10,7 +10,9 @@ repository = "https://github.com/BaeTab/real_live_wall"
 readme = "README.md"
 
 [dependencies]
-wgpu = { version = "30", features = ["glsl", "wgsl"] }
+# wgpu 29 (not 30) to match egui-wgpu 0.35's `wgpu ^29` requirement so the GUI
+# and the engine share a single wgpu version.
+wgpu = { version = "29", features = ["glsl", "wgsl"] }
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
@@ -22,6 +24,11 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
+# GUI settings panel
+egui = "0.35"
+egui-wgpu = "0.35"
+egui-winit = "0.35"
+rfd = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

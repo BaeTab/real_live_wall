@@ -37,7 +37,6 @@ impl Gpu {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
-            apply_limit_buckets: false,
         }))
         .context("no suitable GPU adapter found")?;
 
@@ -93,5 +92,22 @@ impl Gpu {
     /// Reconfigure the surface after a Lost/Outdated acquisition.
     pub fn reconfigure(&mut self) {
         self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Acquire the next swapchain image, transparently reconfiguring on
+    /// outdated/lost surfaces. `None` means "skip this frame".
+    pub fn acquire(&mut self) -> Option<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                Some(t)
+            }
+            wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost
+            | wgpu::CurrentSurfaceTexture::Validation => {
+                self.reconfigure();
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => None,
+        }
     }
 }
