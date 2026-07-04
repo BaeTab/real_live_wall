@@ -52,10 +52,12 @@
 | `reactive.rs` | sysinfo CPU/메모리 샘플링 |
 | `ui.rs` | egui 설정 패널(씬/오디오/게인/미터/월페이퍼 적용), 셰이더 위에 합성 |
 | `platform.rs` | 월페이퍼 표면 획득 — Windows `WorkerW` 모니터별 부착, 네임드 이벤트 기반 원격 종료, 바탕화면 복구, mac/linux 스텁 |
-| `persist.rs` | 설정 영속화 — `%APPDATA%/real_live_wall/config.toml` (serde+toml) 로드/저장 |
+| `persist.rs` | 설정 영속화 — `%APPDATA%/real_live_wall/config.toml` (serde+toml) 로드/저장. 재생목록(스케줄러) 필드 포함 |
 | `tray.rs` | 시스템 트레이 아이콘 + 팝업 메뉴 (전용 스레드·메시지 루프, `Shell_NotifyIconW`) |
 | `startup.rs` | 로그인 자동 시작 — HKCU Run 레지스트리 키 등록/해제 |
 | `screenshot.rs` | 헤드리스 QA 경로(`--screenshot`) — 창 없이 씬을 HDR 포스트FX까지 오프스크린 렌더해 PNG로 저장 |
+| `nowplaying.rs` | Windows SMTC 재생 곡 폴링(1Hz, 전용 스레드) — 제목/아티스트/재생 상태 + 앨범아트 히스토그램 팔레트(4색) 추출 |
+| `update.rs` | GitHub 릴리즈 기반 자동 업데이트 — 최신 릴리즈 조회(백그라운드 스레드), Windows zip 자산 다운로드/추출 후 detached 배치 스크립트로 프로세스 교체·재시작 |
 
 ## uniform 계약
 
@@ -65,15 +67,21 @@ layout(std140, set = 0, binding = 0) uniform Uniforms {
     vec4 mouse;       // xy = 현재, zw = 클릭 (origin: 좌하단)
     vec4 time;        // x=iTime, y=iTimeDelta, z=iFrame, w=sampleRate
     vec4 audio;       // x=bass, y=mid, z=treble, w=volume  (0..1)
-    vec4 sys;         // x=cpu, y=mem, z=beat, w=fps
+    vec4 sys;         // x=cpu, y=mem, z=beat(레거시 미러), w=fps
     vec4 date;        // year, month, day, secondsInDay
+    vec4 beat;        // x=펄스(0..1,감쇠), y=bpm, z=신뢰도(0..1), w=raw onset
+    vec4 media;       // x=hasMusic, y=isPlaying, z=trackChange 펄스, w=예약
+    vec4 palette[4];  // 앨범아트 대표색: xyz=rgb(0..1), w=prominence(0이 최강)
     vec4 spectrum[16];// 64 FFT bins (0..1)
 };
 ```
 
 Shadertoy 셰이더는 `shader.rs`의 래퍼가 위 블록을 `#define iResolution ...` 등으로
 다시 매핑하고, `mainImage(out vec4, in vec2)`를 호출하는 `main()`을 자동 생성한다.
-확장 헬퍼: `iBass/iMid/iTreble/iVolume`, `iCpu/iMem`, `float iSpectrum(float x)`.
+확장 헬퍼: `iBass/iMid/iTreble/iVolume`, `iCpu/iMem`, `float iSpectrum(float x)`,
+`iBeat/iBpm/iBeatConf/iOnset`(`audio.rs`의 온셋 검출·자기상관 템포 추정),
+`iHasMusic/iPlaying/iTrackChange`, `vec3 iPalette(int i)`(`nowplaying.rs`의 SMTC
+재생 곡 + 앨범아트 팔레트).
 
 ## 렌더 파이프라인
 
@@ -119,6 +127,16 @@ Shadertoy 셰이더는 `shader.rs`의 래퍼가 위 블록을 `#define iResoluti
   `REG_SZ`로 등록/해제.
 - **단일 인스턴스**: wallpaper 시작 시 `platform::wallpaper_running()`(stop 이벤트 존재
   여부)로 이미 실행 중이면 즉시 종료.
+- **자동 일시정지(wallpaper 모드 전용)**: 프레임 루프가 매 틱
+  `platform::foreground_is_fullscreen()`(기본 동작)과 `platform::on_battery()`
+  (`--pause-on-battery` 옵트인)를 확인해, 참이면 렌더·오디오 폴링을 건너뛰고
+  120ms 슬립으로 스로틀한다. `--allow-when-fullscreen`으로 끌 수 있다.
+- **재생목록 스케줄러**: `settings.playlist_enabled`가 켜져 있으면 프레임 루프가
+  `playlist_interval_secs`마다 `advance_scene(shuffle)`(트레이 "다음 씬"과 동일
+  경로)을 호출해 씬을 자동 순환한다.
+- **자동 업데이트(`update.rs`)**: preview 프로세스가 기동 시 백그라운드 스레드로
+  GitHub 최신 릴리즈를 조회하고, 더 새 버전이면 패널에 배너를 띄운다. 설치는
+  detached 배치 스크립트가 이 프로세스 종료를 기다렸다가 `robocopy`로 교체한다.
 
 ## 월페이퍼 생명주기 / 원격 종료
 
@@ -135,10 +153,13 @@ Shadertoy 셰이더는 `shader.rs`의 래퍼가 위 블록을 `#define iResoluti
 
 - [x] 멀티모니터 — 모니터마다 전체 장면 개별 렌더 (완료)
 - [x] 트레이 · 자동 시작 · 설정 저장 · 단일 인스턴스 (v1.0)
+- [x] 배터리/포그라운드 전체화면 감지 시 자동 일시정지 (v1.2)
+- [x] 비트/BPM 감지 · 재생 곡(SMTC) 앨범아트 팔레트 반응 (v1.2)
+- [x] 씬 썸네일 갤러리 · 재생목록 스케줄러 (v1.2)
+- [x] 자동 업데이트(GitHub 릴리즈 기준) (v1.2)
 - [ ] 모니터별 씬 개별 선택
 - [ ] Shadertoy `iChannel0` 오디오 텍스처 완전 호환 (현재는 uniform 스펙트럼)
 - [ ] 멀티패스(버퍼) 셰이더 그래프
 - [ ] 날씨/캘린더/알림 리액티브 소스
 - [ ] macOS/Linux 표면 구현
 - [ ] 씬 매니페스트(JSON) + 워크샵/갤러리
-- [ ] 배터리/포그라운드 전체화면 감지 시 자동 일시정지

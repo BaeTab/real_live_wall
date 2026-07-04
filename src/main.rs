@@ -12,6 +12,7 @@ mod app;
 mod audio;
 mod config;
 mod gpu;
+mod nowplaying;
 mod persist;
 mod platform;
 mod postfx;
@@ -23,6 +24,7 @@ mod startup;
 mod tray;
 mod ui;
 mod uniforms;
+mod update;
 
 use clap::Parser;
 use winit::event_loop::{ControlFlow, EventLoop};

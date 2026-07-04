@@ -31,7 +31,31 @@
 
 ![real_live_wall 설정 GUI](docs/screenshots/gui.png)
 
+패널 전체(씬 갤러리 + 오디오/재생 곡/시스템 카드)는 [`docs/screenshots/gui-full.png`](docs/screenshots/gui-full.png) 참고.
+
 > 실측 환경: Windows 11 · NVIDIA RTX 3060 · Vulkan 백엔드 · 4모니터 동시 부착.
+
+## 🆕 v1.2 — 리액티브 스프린트
+
+이번 릴리즈는 차별화 3축 중 **1번(리액티브 데이터)**을 가장 깊게 판 릴리즈입니다.
+
+- **🎵 재생 곡(Now Playing) 앨범아트 팔레트** *(킬러 기능)* — Windows SMTC로 지금
+  재생 중인 곡의 제목·아티스트·앨범아트를 읽고, 앨범아트에서 대표색 4개를 추출해
+  셰이더로 흘려보냅니다. 기본 오로라 씬은 음악이 재생되면 그 앨범의 색으로 물들고
+  비트에 맞춰 펄스합니다. Spotify든 유튜브뮤직이든 틀기만 하면 배경이 반응 — Wallpaper
+  Engine에도 없는 "살아있음"입니다.
+- **🥁 비트/BPM 싱크** — 스펙트럴 플럭스 온셋 검출 + 자기상관 템포 추정으로 곡의
+  박자에 맞춰 씬이 반응합니다. 설정 패널에 실시간 "♩ NN BPM · 비트 감지" 표시.
+- **⏸️ 자동 일시정지** — 전체화면 게임/영상이 포그라운드이거나 노트북이 배터리로
+  구동될 때 렌더를 멈춰 GPU·전력을 아낍니다. "초저부하 & 매너" 원칙의 핵심 안전장치.
+- **🖼️ 씬 썸네일 갤러리** — 텍스트 드롭다운 대신 8개 씬을 2열 썸네일 그리드로
+  골라 쓸 수 있습니다.
+- **🔁 재생목록 자동 순환** — N분마다(셔플 옵션 포함) 씬을 자동으로 바꿔주는
+  "설정하고 잊는" 모드.
+- **⬆️ 자동 업데이트** — 실행 시 GitHub 최신 릴리즈를 조회해 새 버전이 있으면 설정
+  패널에 배너로 알리고, 클릭 한 번으로 다운로드·설치·재시작합니다.
+- **🎨 설정 GUI 전면 고도화** — 딥 네이비 반투명 패널 + 오로라틸 액센트 + 카드형
+  레이아웃으로 다시 디자인했습니다.
 
 ## 🎬 씬 갤러리 (v1.1 판매급 리마스터)
 
@@ -105,6 +129,8 @@ cargo run --release -- --stop
 | `--width`/`--height` | `1280`/`720` | preview 창 크기 |
 | `--screenshot <path>` | — | 창 없이 오프스크린 렌더(HDR 포스트FX 포함) 후 지정 경로에 PNG 저장하고 종료. 씬 QA·README 스크린샷 갱신용 |
 | `--sim-time <sec>` | `20.0` | `--screenshot`에서 사용할 시뮬레이션 `iTime`(오디오는 무음으로 렌더) |
+| `--allow-when-fullscreen` | `false` | 전체화면 앱(게임/영상)이 포그라운드여도 렌더를 멈추지 않음 (기본은 자동 일시정지) |
+| `--pause-on-battery` | `false` | 노트북이 배터리로 구동될 때도 자동 일시정지 |
 
 ## 🎨 셰이더 작성 (Shadertoy 호환)
 
@@ -127,6 +153,14 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 | `float iBass / iMid / iTreble / iVolume` | 오디오 밴드 에너지 (0..1) |
 | `float iSpectrum(float x)` | `x`(0..1) 위치의 FFT 스펙트럼 |
 | `float iCpu / iMem` | CPU·메모리 부하 (0..1) |
+| `float iBeat` | 온셋(비트) 검출 시 1.0으로 튀고 감쇠하는 펄스 |
+| `float iBpm` | 추정 BPM (자신 없으면 `0.0`) |
+| `float iBeatConf` | `iBpm` 추정의 신뢰도 (0..1) |
+| `float iOnset` | 프레임별 원시 온셋 강도(스펙트럴 플럭스), 0..1 정규화 |
+| `float iHasMusic` | SMTC 세션 존재 여부 (0/1) |
+| `float iPlaying` | 그 세션이 실제 재생 중인지 (0/1) |
+| `float iTrackChange` | 곡이 바뀐 순간 1.0으로 튀고 감쇠하는 펄스 |
+| `vec3 iPalette(int i)` | 앨범아트 대표색 4개 중 `i`번째(0이 가장 강함) |
 
 예제: [`shaders/plasma.glsl`](shaders/plasma.glsl)(순수 Shadertoy),
 [`shaders/audio_bars.glsl`](shaders/audio_bars.glsl)(오디오 반응).
@@ -157,14 +191,16 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 - [x] 멀티모니터 — 모니터마다 전체 장면 개별 렌더
 - [x] 실행 중 월페이퍼 원격 종료(`--stop` / 패널 버튼) + 바탕화면 복구
 - [x] 시스템 트레이 제어 · 로그인 자동 시작 · 설정 저장(`config.toml`) · 단일 인스턴스
+- [x] 전체화면·배터리 감지 자동 일시정지
+- [x] 비트/BPM 감지 · 재생 곡(SMTC) 앨범아트 팔레트 반응
+- [x] 씬 썸네일 갤러리 · 재생목록(자동 순환/셔플) 스케줄러
+- [x] 자동 업데이트 (GitHub 릴리즈 기준)
 - [ ] macOS/Linux 월페이퍼 표면 구현
 - [ ] 모니터별 씬 개별 선택
-- [ ] 비트/BPM 감지 · 재생 곡(SMTC) 앨범아트 팔레트 반응
 - [ ] Shadertoy `iChannel0` 오디오 텍스처 완전 호환
 - [ ] 멀티패스(버퍼) 셰이더
 - [ ] 날씨/캘린더 리액티브 소스
-- [ ] 전체화면·배터리 감지 자동 일시정지
-- [ ] 씬 매니페스트(JSON) + 갤러리
+- [ ] 씬 매니페스트(JSON) + 파라미터 노출
 
 ## 📄 라이선스
 

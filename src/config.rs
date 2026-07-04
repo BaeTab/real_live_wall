@@ -106,4 +106,13 @@ pub struct Config {
     /// Simulated iTime in seconds for --screenshot (audio is silent).
     #[arg(long, default_value_t = 20.0)]
     pub sim_time: f32,
+
+    /// Keep rendering even when a fullscreen app (game/video) is foreground.
+    /// By default the wallpaper pauses there to stay out of the way and save GPU.
+    #[arg(long, default_value_t = false)]
+    pub allow_when_fullscreen: bool,
+
+    /// Also pause rendering while the machine runs on battery power.
+    #[arg(long, default_value_t = false)]
+    pub pause_on_battery: bool,
 }

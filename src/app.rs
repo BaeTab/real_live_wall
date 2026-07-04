@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -24,6 +24,7 @@ use winit::window::{Window, WindowId};
 use crate::audio::AudioEngine;
 use crate::config::{AudioArg, Config, Mode};
 use crate::gpu::{Gpu, GpuContext};
+use crate::nowplaying::NowPlayingHandle;
 use crate::persist::PersistConfig;
 use crate::platform::{self, MonitorRect};
 use crate::postfx::PostFx;
@@ -151,7 +152,14 @@ struct State {
     renderer: Renderer,
     audio: Option<AudioEngine>,
     reactive: Reactive,
+    nowplaying: NowPlayingHandle,
     uniforms: Uniforms,
+    /// Decaying pulse (0..1) triggered when the playing track changes.
+    track_pulse: f32,
+    /// Whether the wallpaper is currently paused (fullscreen app / on battery).
+    paused: bool,
+    allow_when_fullscreen: bool,
+    pause_on_battery: bool,
 
     mode: Mode,
     ssaa: f32,
@@ -159,6 +167,7 @@ struct State {
     settings: Settings,
     scenes: Vec<Scene>,
     scene_names: Vec<String>,
+    scene_thumb_keys: Vec<String>,
     wallpaper_child: Option<Child>,
     // Keeps the wallpaper stop-watcher thread's ownership marker alive.
     _stop_guard: Option<platform::StopGuard>,
@@ -167,6 +176,8 @@ struct State {
 
     start: Instant,
     last_frame: Instant,
+    /// When the playlist last auto-advanced the scene.
+    last_scene_switch: Instant,
     frame: u32,
     fps: f32,
     mouse: [f32; 4],
@@ -174,6 +185,11 @@ struct State {
     shader_path: Option<PathBuf>,
     _watcher: Option<RecommendedWatcher>,
     watch_rx: Option<Receiver<()>>,
+
+    /// A background thread drops a newer GitHub release here (if any).
+    update_slot: Arc<Mutex<Option<crate::update::UpdateInfo>>>,
+    /// Latched update once seen, so the panel can offer to install it.
+    available_update: Option<crate::update::UpdateInfo>,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -331,7 +347,19 @@ fn build_state(
     };
     let (scenes, scene_index) = select_scenes(config, preferred);
     let shader_path = load_scene(&gpu0, &mut renderer, &scenes[scene_index]);
-    let scene_names = scenes.iter().map(|s| s.name.clone()).collect();
+    let scene_names: Vec<String> = scenes.iter().map(|s| s.name.clone()).collect();
+    // Thumbnail lookup key per scene: the built-in aurora is "builtin", every
+    // GLSL scene uses its file stem (matches assets/thumbnails/<key>.png).
+    let scene_thumb_keys: Vec<String> = scenes
+        .iter()
+        .map(|s| match &s.source {
+            SceneSource::Builtin => "builtin".to_string(),
+            SceneSource::Glsl(p) => p
+                .file_stem()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        })
+        .collect();
 
     // --- one render target per window ---------------------------------------
     let mut monitors = Vec::with_capacity(specs.len());
@@ -377,6 +405,23 @@ fn build_state(
         .to_source()
         .map(|src| AudioEngine::new(src, gain));
 
+    // --- now-playing (SMTC) background poller: album-art palette + state ----
+    let nowplaying = NowPlayingHandle::spawn();
+
+    // --- background update check (preview/settings process only) ------------
+    let update_slot: Arc<Mutex<Option<crate::update::UpdateInfo>>> = Arc::new(Mutex::new(None));
+    if config.mode == Mode::Preview {
+        let slot = update_slot.clone();
+        crate::update::check_async(env!("CARGO_PKG_VERSION"), move |res| {
+            if let Some(info) = res {
+                log::info!("update available: v{}", info.version);
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(info);
+                }
+            }
+        });
+    }
+
     // --- optional hot-reload watcher ----------------------------------------
     let (mut watcher, mut watch_rx) = (None, None);
     if config.watch {
@@ -405,7 +450,12 @@ fn build_state(
         renderer,
         audio,
         reactive: Reactive::new(),
+        nowplaying,
         uniforms: Uniforms::default(),
+        track_pulse: 0.0,
+        paused: false,
+        allow_when_fullscreen: config.allow_when_fullscreen,
+        pause_on_battery: config.pause_on_battery,
         mode: config.mode,
         ssaa,
         ui,
@@ -415,20 +465,27 @@ fn build_state(
             gain,
             panel_open: config.mode == Mode::Preview,
             autostart: startup::autostart_enabled(),
+            playlist_enabled: persisted.playlist_enabled,
+            playlist_interval_secs: persisted.playlist_interval_secs,
+            playlist_shuffle: persisted.playlist_shuffle,
         },
         scenes,
         scene_names,
+        scene_thumb_keys,
         wallpaper_child: None,
         _stop_guard: stop_guard,
         _tray: tray_handle,
         start: now,
         last_frame: now,
+        last_scene_switch: now,
         frame: 0,
         fps: 60.0,
         mouse: [0.0; 4],
         shader_path,
         _watcher: watcher,
         watch_rx,
+        update_slot,
+        available_update: None,
     })
 }
 
@@ -568,6 +625,15 @@ impl State {
         self.fps = self.fps * 0.9 + (1.0 / dt) * 0.1;
         self.frame = self.frame.wrapping_add(1);
 
+        // --- latch a background update-check result -------------------------
+        if self.available_update.is_none() {
+            if let Ok(mut g) = self.update_slot.lock() {
+                if g.is_some() {
+                    self.available_update = g.take();
+                }
+            }
+        }
+
         // --- hot reload -----------------------------------------------------
         if let (Some(rx), Some(path)) = (self.watch_rx.as_ref(), self.shader_path.as_ref()) {
             if rx.try_iter().count() > 0 {
@@ -587,6 +653,35 @@ impl State {
             }
         }
 
+        // --- pause on a foreground fullscreen app / on battery --------------
+        // Wallpaper mode only: the preview window must stay responsive. Skips
+        // all GPU + audio work and throttles the loop so a paused wallpaper
+        // costs almost nothing (protects games and laptop battery).
+        if self.mode == Mode::Wallpaper {
+            let pause = (!self.allow_when_fullscreen && platform::foreground_is_fullscreen())
+                || (self.pause_on_battery && platform::on_battery());
+            if pause != self.paused {
+                self.paused = pause;
+                log::info!(
+                    "wallpaper {}",
+                    if pause { "paused (fullscreen app / battery)" } else { "resumed" }
+                );
+            }
+            if pause {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                return Vec::new();
+            }
+        }
+
+        // --- playlist: auto-advance the scene on a timer --------------------
+        if self.settings.playlist_enabled && self.scenes.len() > 1 {
+            let interval = self.settings.playlist_interval_secs.max(30);
+            if (now - self.last_scene_switch).as_secs() >= interval {
+                self.advance_scene(self.settings.playlist_shuffle);
+                self.last_scene_switch = now;
+            }
+        }
+
         // --- reactive inputs (sampled once for all monitors) ----------------
         if let Some(a) = self.audio.as_mut() {
             a.set_gain(self.settings.gain);
@@ -595,6 +690,14 @@ impl State {
         let audio_active = self.audio.as_ref().map(|a| a.is_active()).unwrap_or(false);
         let (cpu, mem) = self.reactive.poll();
         let sample_rate = self.audio.as_ref().map(|a| a.sample_rate()).unwrap_or(44_100.0);
+
+        // Now-playing snapshot: album-art palette + a decaying track-change pulse.
+        let np = self.nowplaying.latest();
+        if np.track_changed {
+            self.track_pulse = 1.0;
+        } else {
+            self.track_pulse *= 0.985;
+        }
 
         // --- draw every monitor ---------------------------------------------
         let mut actions = Vec::new();
@@ -611,7 +714,20 @@ impl State {
                 u.time = [t, dt, self.frame as f32, sample_rate];
                 u.audio =
                     [audio_frame.bass, audio_frame.mid, audio_frame.treble, audio_frame.volume];
-                u.sys = [cpu, mem, audio_frame.bass, self.fps];
+                u.sys = [cpu, mem, audio_frame.beat, self.fps];
+                u.beat = [
+                    audio_frame.beat,
+                    audio_frame.bpm,
+                    audio_frame.beat_confidence,
+                    audio_frame.onset,
+                ];
+                u.media = [
+                    if np.has_music { 1.0 } else { 0.0 },
+                    if np.is_playing { 1.0 } else { 0.0 },
+                    self.track_pulse,
+                    0.0,
+                ];
+                u.set_palette(&np.palette, [1.0, 0.72, 0.5, 0.35]);
                 u.set_spectrum(&audio_frame.spectrum);
             }
 
@@ -624,9 +740,15 @@ impl State {
                     mid: audio_frame.mid,
                     treble: audio_frame.treble,
                     volume: audio_frame.volume,
+                    bpm: audio_frame.bpm,
                     cpu,
                     mem,
                     wallpaper_running: self.wallpaper_active(),
+                    has_music: np.has_music,
+                    music_title: np.title.clone(),
+                    music_artist: np.artist.clone(),
+                    palette: np.palette,
+                    update_version: self.available_update.as_ref().map(|u| u.version.clone()),
                 };
                 actions = self.render_primary(meters);
             } else {
@@ -645,6 +767,7 @@ impl State {
         let uniforms = &self.uniforms;
         let settings = &mut self.settings;
         let scene_names = &self.scene_names;
+        let thumb_keys = &self.scene_thumb_keys;
         let Some(ui) = self.ui.as_mut() else {
             return Vec::new();
         };
@@ -672,6 +795,7 @@ impl State {
             &mut encoder,
             settings,
             scene_names,
+            thumb_keys,
             &meters,
         );
 
@@ -710,6 +834,22 @@ impl State {
                 }
                 self.save_prefs();
             }
+            UiAction::PlaylistChanged => {
+                self.last_scene_switch = Instant::now();
+                self.save_prefs();
+            }
+            UiAction::ApplyUpdate => {
+                if let Some(info) = self.available_update.clone() {
+                    match crate::update::download_and_apply(&info) {
+                        Ok(()) => {
+                            log::info!("update v{} staged; exiting to let the helper apply it", info.version);
+                            self.save_prefs();
+                            event_loop.exit();
+                        }
+                        Err(e) => log::error!("update apply failed: {e:#}"),
+                    }
+                }
+            }
             UiAction::Quit => {
                 self.save_prefs();
                 event_loop.exit();
@@ -740,14 +880,36 @@ impl State {
     /// Advance to the next scene (used by the tray in wallpaper mode). The scene
     /// renderer is shared, so one load applies to every monitor.
     fn cycle_scene(&mut self) {
-        if self.scenes.is_empty() {
+        self.advance_scene(false);
+    }
+
+    /// Advance the scene sequentially, or (shuffle) to a random *other* scene.
+    /// Shared by the tray "next scene" and the playlist auto-cycle timer.
+    fn advance_scene(&mut self, shuffle: bool) {
+        let n = self.scenes.len();
+        if n <= 1 {
             return;
         }
-        self.settings.scene = (self.settings.scene + 1) % self.scenes.len();
-        if let Some(scene) = self.scenes.get(self.settings.scene) {
+        let cur = self.settings.scene;
+        let next = if shuffle {
+            // Cheap entropy from the wall clock; +1 skips the current scene.
+            let entropy = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as usize)
+                .unwrap_or_else(|_| cur.wrapping_mul(2654435761));
+            (cur + 1 + entropy % (n - 1)) % n
+        } else {
+            (cur + 1) % n
+        };
+        self.settings.scene = next;
+        if let Some(scene) = self.scenes.get(next) {
             self.shader_path = load_scene(&self.monitors[0].gpu, &mut self.renderer, scene);
-            log::info!("tray: scene → {}", self.scene_names.get(self.settings.scene).map(|s| s.as_str()).unwrap_or("?"));
+            log::info!(
+                "scene → {}",
+                self.scene_names.get(next).map(|s| s.as_str()).unwrap_or("?")
+            );
         }
+        self.save_prefs();
     }
 
     /// The command line that autostart should run to reproduce the current scene.
@@ -768,6 +930,12 @@ impl State {
             self.settings.gain,
             self.ssaa
         ));
+        if self.allow_when_fullscreen {
+            cmd.push_str(" --allow-when-fullscreen");
+        }
+        if self.pause_on_battery {
+            cmd.push_str(" --pause-on-battery");
+        }
         cmd
     }
 
@@ -800,6 +968,9 @@ impl State {
             gain: self.settings.gain,
             ssaa: self.ssaa,
             autostart: startup::autostart_enabled(),
+            playlist_enabled: self.settings.playlist_enabled,
+            playlist_interval_secs: self.settings.playlist_interval_secs,
+            playlist_shuffle: self.settings.playlist_shuffle,
         }
         .save();
     }
@@ -834,6 +1005,12 @@ impl State {
         }
         cmd.arg("--audio").arg(self.settings.audio.as_cli());
         cmd.arg("--gain").arg(format!("{}", self.settings.gain));
+        if self.allow_when_fullscreen {
+            cmd.arg("--allow-when-fullscreen");
+        }
+        if self.pause_on_battery {
+            cmd.arg("--pause-on-battery");
+        }
         Ok(cmd.spawn()?)
     }
 }

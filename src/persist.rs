@@ -17,6 +17,21 @@ pub struct PersistConfig {
     pub ssaa: f32,
     /// Register the wallpaper engine in the Windows autostart registry key.
     pub autostart: bool,
+    /// Auto-cycle through the scene list on a timer (playlist mode).
+    #[serde(default)]
+    pub playlist_enabled: bool,
+    /// Seconds between automatic scene changes when the playlist is on.
+    #[serde(default = "default_interval")]
+    pub playlist_interval_secs: u64,
+    /// Pick the next scene at random instead of in order.
+    #[serde(default)]
+    pub playlist_shuffle: bool,
+}
+
+/// Default playlist interval (5 minutes) — used for older config files that
+/// predate the playlist fields.
+fn default_interval() -> u64 {
+    300
 }
 
 impl Default for PersistConfig {
@@ -27,6 +42,9 @@ impl Default for PersistConfig {
             gain: 6.0,
             ssaa: 1.5,
             autostart: false,
+            playlist_enabled: false,
+            playlist_interval_secs: default_interval(),
+            playlist_shuffle: false,
         }
     }
 }

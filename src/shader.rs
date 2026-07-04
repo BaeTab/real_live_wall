@@ -30,6 +30,9 @@ struct Uniforms {
     audio: vec4<f32>,
     sys: vec4<f32>,
     date: vec4<f32>,
+    beat: vec4<f32>,                     // x=pulse, y=bpm, z=confidence, w=onset
+    media: vec4<f32>,                    // x=hasMusic, y=isPlaying, z=trackPulse
+    palette: array<vec4<f32>, 4>,        // album-art colours (xyz=rgb, w=weight)
     spectrum: array<vec4<f32>, 16>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -161,6 +164,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let bass = u.audio.x;
     let treble = u.audio.z;
     let vol = u.audio.w;
+    let beat = u.beat.x;                     // decaying pulse on each detected onset
+    // how strongly the album-art palette colours the scene (0 when no music)
+    let music = u.media.x * (0.35 + 0.65 * u.media.y);
     let aspect = res.x / max(res.y, 1.0);
 
     let sky = 1.0 - uv.y;                    // 0 at the water line's floor, 1 at the top
@@ -189,8 +195,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
                         * (1.25 + 0.5 * treble);
     col = col + starcol * star_fade * (0.7 + 0.7 * milky);
 
-    // --- aurora curtains ----------------------------------------------------
-    col = col + aurora_color(cx, sky, t, bass);
+    // --- aurora curtains (beat gives a gentle brightness kick) --------------
+    var aurora = aurora_color(cx, sky, t, bass) * (1.0 + 0.22 * beat);
+    // when music is playing, drift the aurora hue toward the album palette
+    let apal = mix(u.palette[0].xyz, u.palette[2].xyz, smoothstep(0.3, 0.9, sky));
+    let alum = max(aurora.x, max(aurora.y, aurora.z));
+    aurora = mix(aurora, apal * alum * 1.4, music * 0.5);
+    col = col + aurora;
 
     // --- distant mountains (atmospheric haze) ------------------------------
     let rf = horizon + 0.050 + 0.085 * fbm(vec2<f32>(cx * 0.8 + 20.0, 3.0));
@@ -245,7 +256,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var bar_col = mix(vec3<f32>(0.10, 1.0, 0.50), vec3<f32>(0.20, 0.80, 1.0),
                       smoothstep(0.0, 0.45, hy));
     bar_col = mix(bar_col, vec3<f32>(0.75, 0.35, 1.0), smoothstep(0.40, 0.85, hy));
-    let emis = 0.55 + 1.0 * h01;
+    // with music, recolour the bars from the album palette (base→tip = col0→col2)
+    let palBar = mix(u.palette[0].xyz, u.palette[2].xyz, smoothstep(0.0, 0.9, hy));
+    bar_col = mix(bar_col, palBar, music * 0.6);
+    let emis = (0.55 + 1.0 * h01) * (1.0 + 0.35 * beat);
     // upright rounded bar (capsule) with anti-aliased edge
     let sd_up = sd_segment(frag.xy, base, top) - hw;
     let up_mask = smoothstep(1.5, -1.0, sd_up);
@@ -286,6 +300,9 @@ layout(std140, set = 0, binding = 0) uniform Uniforms {
     vec4 audio;
     vec4 sys;
     vec4 date;
+    vec4 beat;
+    vec4 media;
+    vec4 palette[4];
     vec4 spectrum[16];
 } rlw;
 
@@ -304,10 +321,24 @@ layout(std140, set = 0, binding = 0) uniform Uniforms {
 #define iVolume       rlw.audio.w
 #define iCpu          rlw.sys.x
 #define iMem          rlw.sys.y
+// --- beat / tempo (onset detection + BPM estimate) ---
+#define iBeat         rlw.beat.x
+#define iBpm          rlw.beat.y
+#define iBeatConf     rlw.beat.z
+#define iOnset        rlw.beat.w
+// --- now-playing (SMTC): music state + album-art palette ---
+#define iHasMusic     rlw.media.x
+#define iPlaying      rlw.media.y
+#define iTrackChange  rlw.media.z
 
 float iSpectrum(float x) {
     int idx = int(clamp(x, 0.0, 1.0) * 63.0);
     return rlw.spectrum[idx >> 2][idx & 3];
+}
+
+// Dominant album-art colour i (0..3); i=0 is the strongest. rgb 0..1.
+vec3 iPalette(int i) {
+    return rlw.palette[clamp(i, 0, 3)].xyz;
 }
 "#;
 

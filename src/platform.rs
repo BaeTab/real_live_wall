@@ -83,6 +83,36 @@ pub fn restore_desktop() {
     }
 }
 
+/// Whether the foreground window is a fullscreen app filling its own monitor
+/// (games, video players, etc). The desktop shell (`Progman`/`WorkerW`) and
+/// ordinary windows never count, so this is meant to catch only the case
+/// where the wallpaper engine should throttle itself to save resources.
+#[allow(dead_code)]
+pub fn foreground_is_fullscreen() -> bool {
+    #[cfg(windows)]
+    {
+        win::foreground_is_fullscreen()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Whether the machine is currently running on battery power (no AC
+/// connected). Always false on desktops, or when the state can't be read.
+#[allow(dead_code)]
+pub fn on_battery() -> bool {
+    #[cfg(windows)]
+    {
+        win::on_battery()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Opaque handle that keeps the stop-watcher alive. Dropping it does not stop
 /// the watcher thread (which owns the event handle); it just marks ownership.
 pub struct StopGuard {
@@ -99,15 +129,21 @@ mod win {
     use winit::window::Window;
 
     use windows::core::{w, BOOL, PCWSTR};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     use windows::Win32::System::Threading::{
         CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, FindWindowExW, FindWindowW, GetSystemMetrics, SendMessageTimeoutW, SetParent,
-        SetWindowPos, SystemParametersInfoW, HWND_BOTTOM, SMTO_NORMAL, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN, SPIF_SENDWININICHANGE, SPI_GETDESKWALLPAPER, SPI_SETDESKWALLPAPER,
-        SWP_NOACTIVATE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetDesktopWindow,
+        GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindowRect,
+        SendMessageTimeoutW, SetParent, SetWindowPos, SystemParametersInfoW, HWND_BOTTOM,
+        SMTO_NORMAL, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPIF_SENDWININICHANGE,
+        SPI_GETDESKWALLPAPER, SPI_SETDESKWALLPAPER, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     };
 
     use super::MonitorRect;
@@ -287,6 +323,71 @@ mod win {
                 Some(buf.as_ptr() as *mut c_void),
                 SPIF_SENDWININICHANGE,
             );
+        }
+    }
+
+    // --- foreground/power state ---------------------------------------------
+
+    /// A few pixels of slop absorbs off-by-one rounding some apps leave in
+    /// their "fullscreen" window rect vs. the true monitor rect.
+    const FULLSCREEN_SLOP_PX: i32 = 2;
+
+    pub fn foreground_is_fullscreen() -> bool {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_invalid() {
+                return false;
+            }
+
+            // The desktop shell itself is never "fullscreen" in the sense we
+            // care about.
+            if hwnd == GetShellWindow() || hwnd == GetDesktopWindow() {
+                return false;
+            }
+
+            let mut class_buf = [0u16; 256];
+            let len = GetClassNameW(hwnd, &mut class_buf);
+            if len > 0 {
+                let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+                if class_name == "WorkerW" || class_name == "Progman" {
+                    return false;
+                }
+            }
+
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect as *mut RECT).is_err() {
+                return false;
+            }
+
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_invalid() {
+                return false;
+            }
+
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &mut mi as *mut MONITORINFO).as_bool() {
+                return false;
+            }
+
+            let mon = mi.rcMonitor;
+            rect.left <= mon.left + FULLSCREEN_SLOP_PX
+                && rect.top <= mon.top + FULLSCREEN_SLOP_PX
+                && rect.right >= mon.right - FULLSCREEN_SLOP_PX
+                && rect.bottom >= mon.bottom - FULLSCREEN_SLOP_PX
+        }
+    }
+
+    pub fn on_battery() -> bool {
+        unsafe {
+            let mut status = SYSTEM_POWER_STATUS::default();
+            if GetSystemPowerStatus(&mut status as *mut SYSTEM_POWER_STATUS).is_err() {
+                return false;
+            }
+            // 0 = battery, 1 = AC, 255 = unknown.
+            status.ACLineStatus == 0
         }
     }
 }

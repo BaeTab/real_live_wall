@@ -3,6 +3,63 @@
 이 프로젝트의 주요 변경 사항을 기록합니다. 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/),
 버전은 [Semantic Versioning](https://semver.org/lang/ko/)을 따릅니다.
 
+## [1.2.0] - 2026-07-04
+
+리액티브 데이터 축을 가장 깊게 판 릴리즈. 재생 곡 앨범아트 팔레트, 비트/BPM 싱크,
+전체화면·배터리 자동 일시정지, 씬 썸네일 갤러리, 재생목록 스케줄러, GitHub 릴리즈
+기반 자동 업데이트, 설정 GUI 전면 고도화를 추가했다.
+
+### 추가 (Added)
+- **재생 곡(Now Playing) 앨범아트 팔레트** — 신규 `src/nowplaying.rs`: Windows
+  SMTC(`GlobalSystemMediaTransportControlsSessionManager`)를 1초 간격으로 폴링해
+  현재 재생 중인 곡의 제목·아티스트·재생 상태를 읽고, 앨범아트 썸네일을 디코드해
+  히스토그램 기반(k-means 없이 채도 가중 버킷 랭킹)으로 대표색 4개를 추출한다.
+  기본 오로라 씬과 `audio_bars` 씬이 음악 재생 시 그 팔레트로 물들고 곡이 바뀌면
+  짧게 펄스한다. 설정 패널에 "♪ 지금 재생 중" 카드(제목/아티스트 + 팔레트 스와치)
+  추가. SMTC 세션이 없거나 앨범아트 디코드에 실패해도 고정된 앱 테마 팔레트로
+  graceful fallback.
+- **비트/BPM 싱크** — `audio.rs`에 스펙트럴 플럭스 기반 온셋 검출(적응형 임계값:
+  최근 이력의 평균+1.5·표준편차, 절대 하한 포함)과 고정 레이트(50Hz)로 리샘플된
+  온셋 엔벨로프의 자기상관 기반 템포 추정(60~180 BPM 탐색)을 추가했다. 설정 패널에
+  "♩ NN BPM · 비트 감지" 표시.
+- **전체화면·배터리 자동 일시정지** — `platform.rs`에 `foreground_is_fullscreen()`
+  (포그라운드 창 사각형이 자기 모니터 전체를 덮는지, 셸/WorkerW/Progman 제외)과
+  `on_battery()`(`GetSystemPowerStatus`) 추가. 월페이퍼 모드에서 게임/영상이
+  전체화면이거나(기본 동작) 배터리 구동 중(옵트인)이면 렌더·오디오 폴링을 건너뛰고
+  120ms 슬립으로 스로틀한다. 새 CLI 플래그 `--allow-when-fullscreen`(자동 일시정지
+  끄기), `--pause-on-battery`(배터리 시에도 일시정지). 자동 시작 커맨드에도 반영.
+- **씬 스케줄러(재생목록)** — `persist.rs`에 `playlist_enabled` /
+  `playlist_interval_secs`(기본 300초) / `playlist_shuffle` 필드 추가(기존
+  config.toml과 하위 호환되는 `#[serde(default)]`). 설정 패널에 "자동 순환"
+  체크박스 + 분 간격 슬라이더(0.5~60분) + 셔플 옵션. "다음 씬"(트레이)과 자동
+  순환이 같은 `advance_scene()` 경로를 공유.
+- **씬 썸네일 갤러리** — 설정 패널의 씬 선택이 텍스트 드롭다운에서 8개 씬 썸네일
+  2열 그리드(`egui::Grid` + `Button::image`)로 바뀌었다. 썸네일은
+  `assets/thumbnails/<key>.png`(헤드리스 `--screenshot`로 생성)를 지연 로드해
+  텍스처로 캐싱한다. 파일이 없으면 텍스트 라벨로 graceful fallback.
+- **자동 업데이트(GitHub 릴리즈 기준)** — 신규 `src/update.rs`: preview 프로세스
+  시작 시 백그라운드 스레드에서 `GET /repos/BaeTab/real_live_wall/releases/latest`를
+  조회해 현재 버전보다 새로우면 설정 패널 상단에 "⬆ 새 버전 vX.Y.Z 사용 가능 ·
+  다운로드 & 설치" 배너를 띄운다. 클릭 시 Windows zip 자산을 받아
+  `%TEMP%\rlw_update\<version>`에 추출하고, 이 프로세스 종료를 기다렸다가
+  `robocopy`로 설치 디렉터리에 미러링한 뒤 재실행하는 detached 배치 스크립트를
+  스폰한다. 네트워크 실패·자산 없음 등은 전부 `None`/graceful fallback.
+- **셰이더 확장 uniform** — `Uniforms`(std140) 블록에 `beat`(x=펄스, y=bpm,
+  z=신뢰도, w=raw onset), `media`(x=hasMusic, y=isPlaying, z=trackChange 펄스),
+  `palette[4]`(앨범아트 rgb + prominence) 3개 채널을 추가. Rust/WGSL/GLSL 세
+  곳을 바이트 단위로 동기화했다(§엔진 확장 uniform 표 참고). GLSL 헬퍼
+  `iBeat`/`iBpm`/`iBeatConf`/`iOnset`/`iHasMusic`/`iPlaying`/`iTrackChange`/
+  `vec3 iPalette(int)` 추가.
+
+### 변경 (Changed)
+- **설정 GUI 전면 고도화** — `ui.rs`: egui 커스텀 다크 테마(딥 반투명 네이비 패널
+  + 오로라틸(rgb 52,214,178) 액센트 + 라운드 위젯) + 카드형 섹션 레이아웃 +
+  `ScrollArea`. 미터·버튼·체크박스 스타일 전면 리스타일. 새 스크린샷
+  `docs/screenshots/gui.png`(히어로), `docs/screenshots/gui-full.png`(전체 패널).
+- 기본 오로라 WGSL 씬과 `audio_bars` GLSL 씬이 `iBeat`/`iPalette`를 반영하도록
+  갱신(오로라 커튼 밝기 킥 + 팔레트 색상 드리프트, EQ 바 팔레트 리컬러 + 비트
+  이미시브 부스트).
+
 ## [1.1.0] - 2026-07-03
 
 기본 제공 씬 8종을 "판매급" 화질로 전면 리마스터하고, 창 없이 씬을 검증하는
@@ -100,6 +157,7 @@
 - 기본 WGSL 오로라 씬 + 64밴드 스펙트럼, Shadertoy GLSL(`mainImage`) 무수정 로드.
 - 실시간 오디오(FFT) · CPU/메모리 리액티브 입력, GLSL 핫리로드.
 
+[1.2.0]: https://github.com/BaeTab/real_live_wall/releases/tag/v1.2.0
 [1.1.0]: https://github.com/BaeTab/real_live_wall/releases/tag/v1.1.0
 [1.0.0]: https://github.com/BaeTab/real_live_wall/releases/tag/v1.0.0
 [0.4.0]: https://github.com/BaeTab/real_live_wall/releases/tag/v0.4.0
